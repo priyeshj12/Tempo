@@ -7,6 +7,7 @@
 // Usage: node scripts/build-artifact.mjs
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,13 +21,28 @@ const body = html
   .trim();
 const fonts = html.match(/<link rel="stylesheet" href="(https:\/\/fonts\.googleapis\.com[^"]+)">/)[1];
 
+// The full version on GitHub Pages, linked from the artifact for other cities.
+// Override with TEMPO_WEB_URL=... when it is hosted elsewhere.
+function pagesUrl() {
+  if (process.env.TEMPO_WEB_URL) return process.env.TEMPO_WEB_URL;
+  try {
+    const remote = execSync('git remote get-url origin', { cwd: root, encoding: 'utf8' }).trim();
+    const m = remote.match(/github\.com[/:]([^/]+)\/([^/.]+?)(\.git)?$/);
+    if (m) return `https://${m[1].toLowerCase()}.github.io/${m[2]}/`;
+  } catch {
+    /* no git remote */
+  }
+  return '';
+}
+const webUrl = pagesUrl();
+
 const page = `<title>Tempo Meetup Planner</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="${fonts.replace(/&/g, '&amp;')}">
 <style>
 ${css.trim()}
 </style>
-<script>window.TEMPO_EMBED = true;</script>
+<script>window.TEMPO_EMBED = true; window.TEMPO_WEB_URL = ${JSON.stringify(webUrl)};</script>
 ${body}
 <script type="module" src="src/main.js"></script>
 `;
@@ -49,4 +65,4 @@ for (const f of readdirSync(join(root, 'data'))) {
   }
 }
 writeFileSync(join(out, 'files.json'), JSON.stringify(files, null, 2));
-console.log(`build/artifact/index.html (${(page.length / 1024).toFixed(1)} KB) and ${Object.keys(files).length} files to publish`);
+console.log(`build/artifact/index.html (${(page.length / 1024).toFixed(1)} KB) and ${Object.keys(files).length} files to publish; web version: ${webUrl || 'none'}`);

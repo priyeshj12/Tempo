@@ -30,6 +30,8 @@ const lang = (navigator.language || 'en').slice(0, 2);
 // Published as a claude.ai artifact: the page may not call other sites, so
 // it runs on the bundled Tokyo data and saves files through the viewer.
 const EMBED = !!window.TEMPO_EMBED;
+// where the full version lives, for any city (set by the artifact build)
+const WEB_URL = window.TEMPO_WEB_URL || '';
 if (EMBED) setOffline();
 
 const state = {
@@ -335,7 +337,18 @@ async function meetLandmark(lat, lon, stale) {
 }
 
 function showCoverage() {
-  $('coverage').hidden = isLive();
+  const el = $('coverage');
+  el.hidden = isLive();
+  if (EMBED && WEB_URL && !el.querySelector('a')) {
+    el.textContent = 'This version searches Tokyo\u2019s 23 wards. ';
+    const a = document.createElement('a');
+    a.className = 'link';
+    a.href = WEB_URL;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = 'Open Tempo on the web for any city';
+    el.append(a);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +793,12 @@ function renderFriends() {
     status.innerHTML = '';
     const text = document.createElement('span');
     if (f.status === 'pending') text.textContent = 'Looking up';
-    else if (f.status === 'missing') text.textContent = isLive() ? 'No match. Try adding the city.' : 'Not found. Try a station or neighbourhood in Tokyo.';
+    else if (f.status === 'missing')
+      text.textContent = isLive()
+        ? 'No match. Try adding the city.'
+        : WEB_URL
+          ? 'Not found in Tokyo. The web version works in any city.'
+          : 'Not found. Try a station or neighbourhood in Tokyo.';
     else if (f.status === 'error') text.textContent = 'The place search is not answering. Try again in a moment.';
     else if (f.status === 'found') text.textContent = f.detail && f.detail !== f.query ? f.detail : '';
     else text.textContent = 'Neighbourhood, station or address';

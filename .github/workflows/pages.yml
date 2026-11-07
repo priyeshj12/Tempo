@@ -1,0 +1,63 @@
+# Publishes Tempo to GitHub Pages on every push to the default branch.
+# One-time setup: Settings > Pages > Build and deployment > Source: GitHub Actions.
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run the tests
+        run: npm test
+
+      - name: Check that Pages is turned on
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" --silent 2>/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::GitHub Pages is off. Turn it on in Settings > Pages with Source set to GitHub Actions, then run this workflow again."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect the site
+        if: steps.pages.outputs.enabled == 'true'
+        run: |
+          mkdir _site
+          cp -r index.html styles.css src data _site/
+          touch _site/.nojekyll
+
+      - if: steps.pages.outputs.enabled == 'true'
+        uses: actions/configure-pages@v5
+      - if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/deploy-pages@v4

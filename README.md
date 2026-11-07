@@ -32,7 +32,16 @@ npm start          # serves on http://localhost:8000 (or: python3 -m http.server
 npm test           # unit tests (Node 20+)
 ```
 
-Any static host works, including GitHub Pages. Finding places and loading areas other than Tokyo needs the browser to reach `nominatim.openstreetmap.org` and the Overpass API.
+Any static host works. Finding places and loading areas other than Tokyo needs the browser to reach `nominatim.openstreetmap.org` and the Overpass API.
+
+## Putting it on the web (GitHub Pages)
+
+`.github/workflows/pages.yml` runs the tests and deploys the site on every push to the default branch. It needs two one-time settings:
+
+1. Pages needs a public repository on a free GitHub plan: Settings > General > Danger Zone > Change visibility > Public. Private repositories need GitHub Pro, Team or Enterprise.
+2. Settings > Pages > Build and deployment > Source: **GitHub Actions**.
+
+Then run the workflow from the Actions tab (Deploy to GitHub Pages > Run workflow), or push any commit. The site appears at `https://<owner>.github.io/<repo>/`, for this repository `https://priyeshj12.github.io/Tempo/`. Until Pages is on, the workflow runs the tests and skips the deploy with a notice.
 
 ## Code
 
@@ -69,7 +78,7 @@ To use a new preset, add it to `PRESETS` in `src/main.js`.
 
 ## Publishing as a claude.ai artifact
 
-`node scripts/build-artifact.mjs` writes `build/artifact/index.html`, the page in the shape the artifact host expects, and `build/artifact/files.json`, the scripts and data to publish beside it. Artifact pages may not call other sites, so this build runs on the bundled Tokyo data only, hides the share link and saves recorded videos through the viewer's `downloads` capability.
+`node scripts/build-artifact.mjs` writes `build/artifact/index.html`, the page in the shape the artifact host expects, and `build/artifact/files.json`, the scripts and data to publish beside it. Artifact pages may not call other sites, so this build runs on the bundled Tokyo data only, hides the share link, saves recorded videos through the viewer's `downloads` capability, and links to the GitHub Pages version for every other city (set `TEMPO_WEB_URL` to point it elsewhere).
 
 ## Data
 
