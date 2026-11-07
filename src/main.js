@@ -4,7 +4,7 @@ import { solveTogether, separateFloods, dijkstra, tracePath } from './search.js'
 import { buildTimeline } from './timeline.js';
 import { Renderer, STAGE_W, STAGE_H, FONT_SANS, FONT_MONO } from './renderer.js';
 import { lookupCity, geocode, suggest, placeName, landmarkName, overpassQuery, overpass, isLive, setOffline, stationName } from './osm.js';
-import { CATEGORIES, placesQuery, candidatesFrom, candidatesFromTiles, rankByTrip } from './places.js';
+import { CATEGORIES, placesQuery, candidatesFrom, candidatesFromTiles, parkCandidatesFromTiles, rankByTrip } from './places.js';
 import { fetchTiles, decodeLayer, tileLonLat } from './tiles.js';
 import { loadBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from './offline.js';
 import { CanvasRecorder, recordingSupported } from './recorder.js';
@@ -203,7 +203,8 @@ async function loadArea(place) {
     const tol = Math.hypot(b.maxX - b.minX, b.maxY - b.minY) * 0.0007;
     outline = rings.map((r) => simplifyFlat(r, tol)).filter((r) => r.length >= 8);
   }
-  setCity({ id: place.id, name: place.label, outline, detail }, graph);
+  // a box loaded for these friends holds them all, however sparse its roads
+  setCity({ id: place.id, name: place.label, outline, detail, box: [w, s, e, n] }, graph);
 }
 
 function cityPlace(c) {
@@ -277,6 +278,8 @@ async function ensureArea(friends) {
 
 function insideArea(f) {
   if (!state.graph || f.lat == null) return false;
+  const box = state.city?.box;
+  if (box && f.lon >= box[0] && f.lon <= box[2] && f.lat >= box[1] && f.lat <= box[3]) return true;
   const [x, y] = state.graph.proj.fwd(f.lon, f.lat);
   if (state.outlineIndex && state.outlineIndex.contains(x, y)) return true;
   // parks, airports and stations can sit a few hundred metres from a through
@@ -735,17 +738,29 @@ async function loadPlaces() {
   }
 
   // elsewhere: the map tiles' places at once, then Overpass's richer ones
-  // (cuisines, landmarks) merged in if they arrive
+  // (cuisines, landmarks) merged in if they arrive. In quiet areas the
+  // search widens until every group has a few options.
   let fromTiles = [];
   let richer = false;
-  const tilesJob = placesFromTiles(lat, lon).then((c) => {
-    fromTiles = c;
-    if (!richer) show(c, osm);
-  });
-  const overpassJob = overpass(placesQuery(lat, lon, wide)).then((d) => {
-    richer = true;
-    show([...candidatesFrom(d.elements || [], lang), ...fromTiles], osm);
-  });
+  let reach = 1500;
+  let zoom = 14;
+  const tilesJob = (async () => {
+    // places load while the animation plays, so full detail is affordable here
+    for ([reach, zoom] of [[1500, 14], [3000, 14], [6000, 14]]) {
+      // each wider ring adds to what the closer, more detailed ones found
+      fromTiles = [...fromTiles, ...(await placesFromTiles(lat, lon, reach, zoom))];
+      const ranked = rankByTrip(fromTiles, ctx);
+      if (CATEGORIES.every((c) => ranked[c.id].length >= 3)) break;
+    }
+    if (!richer) show(fromTiles, osm);
+  })();
+  const overpassJob = tilesJob
+    .catch(() => {})
+    .then(() => overpass(placesQuery(lat, lon, Math.max(wide, reach))))
+    .then((d) => {
+      richer = true;
+      show([...candidatesFrom(d.elements || [], lang), ...fromTiles], osm);
+    });
   const outcomes = await Promise.allSettled([tilesJob, overpassJob]);
   if (outcomes.every((o) => o.status === 'rejected')) failPlaces(token, outcomes[0].reason);
 }
@@ -759,13 +774,14 @@ function failPlaces(token, err) {
 }
 
 /** Named places from the poi layer of the z14 tiles around a point. */
-async function placesFromTiles(lat, lon, radius = 1500) {
+async function placesFromTiles(lat, lon, radius = 1500, zoom = 14) {
   if (!isLive()) throw new Error('offline');
   const dLat = radius / 111320;
   const dLon = dLat / Math.cos((lat * Math.PI) / 180);
-  const tiles = await fetchTiles([lon - dLon, lat - dLat, lon + dLon, lat + dLat], 14);
-  for (const t of tiles) t.layer = decodeLayer(t.bytes, 'poi', 1);
-  return candidatesFromTiles(tiles, tileLonLat, lang);
+  const tiles = await fetchTiles([lon - dLon, lat - dLat, lon + dLon, lat + dLat], zoom);
+  const pois = tiles.map((t) => ({ ...t, layer: decodeLayer(t.bytes, 'poi', 1) }));
+  const parks = tiles.map((t) => ({ ...t, layer: decodeLayer(t.bytes, 'park', 3) }));
+  return [...candidatesFromTiles(pois, tileLonLat, lang), ...parkCandidatesFromTiles(parks, tileLonLat, [lat, lon], lang)];
 }
 
 const km1 = (v) => `${v.toFixed(1)} km`;

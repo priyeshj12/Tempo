@@ -12,7 +12,7 @@ export const TILEJSON = 'https://tiles.openfreemap.org/planet';
 // OpenMapTiles transportation classes walked or driven on to meet someone.
 const CLASSES = new Set(['trunk', 'primary', 'secondary', 'tertiary', 'minor']);
 
-const MAX_TILES = 64;
+const MAX_TILES = 96;
 
 // ---------------------------------------------------------------------------
 // tile maths
@@ -212,7 +212,8 @@ export function decodeLayer(bytes, name, type = 2) {
       if (type !== wanted) continue;
       const props = {};
       for (let i = 0; i < tags.length; i += 2) props[keys[tags[i]]] = values[tags[i + 1]];
-      features.push(type === 2 ? { props, lines: decodeLines(geom) } : { props, points: decodePoints(geom) });
+      // lines and polygon rings share one encoding; points have their own
+      features.push(type === 1 ? { props, points: decodePoints(geom) } : { props, lines: decodeLines(geom) });
     }
     return { extent, features };
   }
@@ -516,17 +517,30 @@ export async function fetchTiles(box, z, { onProgress = () => {}, template = nul
   const list = tilesForBox(box, z);
   let done = 0;
   let next = 0;
+  let failed = 0;
+  let lastError = null;
+  const one = async (t) => {
+    const res = await fetch(url.replace('{z}', t.z).replace('{x}', t.x).replace('{y}', t.y));
+    if (res.status === 204 || res.status === 404) return new Uint8Array(0);
+    if (!res.ok) throw new Error(`Map tiles answered ${res.status}`);
+    return gunzipIfNeeded(new Uint8Array(await res.arrayBuffer()));
+  };
   const work = async () => {
     while (next < list.length) {
       const t = list[next++];
-      const res = await fetch(url.replace('{z}', t.z).replace('{x}', t.x).replace('{y}', t.y));
-      if (res.status === 204 || res.status === 404) t.bytes = new Uint8Array(0);
-      else if (!res.ok) throw new Error(`Map tiles answered ${res.status}`);
-      else t.bytes = await gunzipIfNeeded(new Uint8Array(await res.arrayBuffer()));
+      // one retry, then go on without the tile rather than lose them all
+      try {
+        t.bytes = await one(t).catch(() => one(t));
+      } catch (err) {
+        failed++;
+        lastError = err;
+        t.bytes = new Uint8Array(0);
+      }
       onProgress(++done, list.length);
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, work));
+  if (failed === list.length) throw lastError || new Error('Map tiles could not be loaded');
   return list;
 }
 

@@ -62,6 +62,55 @@ export function candidatesFromTiles(tiles, tileLonLat, lang = 'en') {
   return out;
 }
 
+const PARK_KINDS = { national_park: 'National park', nature_reserve: 'Nature reserve', protected_area: 'Nature area' };
+
+/**
+ * Named parks and nature areas from the park layer of map tiles, as chill
+ * candidates. Each is placed at its edge nearest to `near` ([lat, lon]),
+ * roughly where you would walk in, since the middle of a forest can be far
+ * from any road.
+ */
+export function parkCandidatesFromTiles(tiles, tileLonLat, near, lang = 'en') {
+  const best = new Map();
+  const [nlat, nlon] = near;
+  const k = Math.cos((nlat * Math.PI) / 180);
+  for (const t of tiles) {
+    const E = t.layer.extent;
+    for (const f of t.layer.features) {
+      const p = f.props;
+      const name = p[`name:${lang}`] || (lang === 'en' && p.name_en) || p.name;
+      if (!name) continue;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const ring of f.lines) {
+        for (let i = 0; i < ring.length; i += 2) {
+          const [lon, lat] = tileLonLat(t.x + ring[i] / E, t.y + ring[i + 1] / E, t.z);
+          const d = Math.hypot(lat - nlat, (lon - nlon) * k);
+          const prev = best.get(name);
+          if (!prev || d < prev.d) {
+            best.set(name, { d, lat, lon, kind: PARK_KINDS[p.class] || 'Park', area: 0 });
+          }
+          minX = Math.min(minX, lon); maxX = Math.max(maxX, lon); minY = Math.min(minY, lat); maxY = Math.max(maxY, lat);
+        }
+      }
+      const b = best.get(name);
+      if (b) b.area = Math.max(b.area, (maxY - minY) * 111320 * (maxX - minX) * 111320 * k);
+    }
+  }
+  return [...best.entries()].map(([name, b]) => ({
+    id: `park:${name}`,
+    category: 'chill',
+    kind: b.kind,
+    name,
+    lat: b.lat,
+    lon: b.lon,
+    area: b.area,
+    notable: true,
+    details: false,
+    park: true,
+    url: `https://www.openstreetmap.org/?mlat=${b.lat.toFixed(6)}&mlon=${b.lon.toFixed(6)}#map=14/${b.lat.toFixed(6)}/${b.lon.toFixed(6)}`,
+  }));
+}
+
 /** Overpass QL for named places of every group around a point. */
 export function placesQuery(lat, lon, radius = 1200) {
   const at = `(around:${Math.round(radius)},${lat.toFixed(6)},${lon.toFixed(6)})`;
@@ -88,6 +137,7 @@ out bb qt 150;
 ${q([
   '["leisure"~"^(park|garden|nature_reserve|beach_resort|marina|sauna)$"]',
   '["natural"="beach"]',
+  '["tourism"="picnic_site"]',
   '["amenity"~"^(bar|pub|biergarten|public_bath|library)$"]',
 ])}
 );
@@ -139,7 +189,8 @@ const KINDS = {
     museum: ['sightseeing', 'Museum'],
     gallery: ['sightseeing', 'Gallery'],
     attraction: ['sightseeing', 'Attraction'],
-    viewpoint: ['sightseeing', 'Viewpoint'],
+    viewpoint: ['chill', 'Viewpoint'],
+    picnic_site: ['chill', 'Picnic spot'],
   },
   natural: {
     beach: ['chill', 'Beach'],
