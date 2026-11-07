@@ -16,6 +16,19 @@ export const OVERPASS_ENDPOINTS = [
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org';
 
+// Whether OpenStreetMap's live services can be reached. A page that may not
+// call other sites, or a lost connection, turns this off for the session and
+// callers fall back to bundled data.
+let live = true;
+export const isLive = () => live;
+export function setOffline() {
+  live = false;
+}
+
+function noteNetworkError(err) {
+  if (err instanceof TypeError) live = false;
+}
+
 // Nominatim's usage policy allows at most one request per second.
 let queue = Promise.resolve();
 let lastCall = 0;
@@ -28,6 +41,7 @@ const cache = new Map();
  * caller giving up never affects another asking for the same URL.
  */
 function nominatim(path, params, stale = null) {
+  if (!live) return Promise.reject(new Error('offline'));
   const url = `${NOMINATIM}/${path}?${new URLSearchParams({ format: 'jsonv2', 'accept-language': navigator.language || 'en', ...params })}`;
   if (cache.has(url)) return cache.get(url);
   const p = queue.then(async () => {
@@ -37,10 +51,16 @@ function nominatim(path, params, stale = null) {
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     if (stale && stale()) throw new Error('stale');
     lastCall = Date.now();
-    const req = fetch(url).then((res) => {
-      if (!res.ok) throw new Error(`Nominatim ${res.status}`);
-      return res.json();
-    });
+    const req = fetch(url).then(
+      (res) => {
+        if (!res.ok) throw new Error(`Nominatim ${res.status}`);
+        return res.json();
+      },
+      (err) => {
+        noteNetworkError(err);
+        throw err;
+      },
+    );
     cache.set(url, req);
     req.catch(() => cache.delete(url));
     return req;
@@ -166,7 +186,7 @@ export async function landmarkName(lat, lon, stale = null) {
   return a.neighbourhood || a.quarter || a.suburb || a.city_district || r.name || a.road || '';
 }
 
-function stationName(name) {
+export function stationName(name) {
   const ascii = /^[\x20-\x7e]+$/.test(name);
   const hasWord = /station|gare|bahnhof|estaci|stazione|stacja|metro|subway|terminal/i.test(name);
   return ascii && !hasWord ? `${name} Station` : name;
@@ -179,6 +199,7 @@ function shortName(r) {
 
 /** Runs a small Overpass query from the page, trying each server in turn. */
 export async function overpass(query, { signal } = {}) {
+  if (!live) throw new Error('offline');
   let lastError;
   for (const url of OVERPASS_ENDPOINTS) {
     try {
@@ -195,6 +216,7 @@ export async function overpass(query, { signal } = {}) {
       lastError = err;
     }
   }
+  noteNetworkError(lastError);
   throw lastError || new Error('Overpass is unreachable');
 }
 

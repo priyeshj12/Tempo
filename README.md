@@ -54,16 +54,22 @@ The interface follows a "city transit map at night" direction: ink neutrals, str
 
 ## Rebuilding or adding a bundled city
 
-Presets are defined in `scripts/presets.json` (boundary relations, road detail and default friends).
+Presets are defined in `scripts/presets.json` (boundary relations, road detail, country and default friends). A preset ships its streets plus its own places and a list of stations, neighbourhoods and landmarks, so it works without OpenStreetMap's live services: Tokyo's things to do and meeting point names always come from the bundle, and starting points fall back to it when Nominatim cannot be reached.
 
 ```sh
 pip install osmium shapely
 # PBF extracts: https://download.openstreetmap.fr/extracts/ or https://download.geofabrik.de/
 python3 scripts/extract_osm.py kanto.osm.pbf tokyo -o build/tokyo-osm.json
-node scripts/build-preset.mjs build/tokyo-osm.json   # writes data/tokyo.tmpo and data/tokyo.json
+node scripts/build-preset.mjs build/tokyo-osm.json      # data/tokyo.tmpo and data/tokyo.json
+python3 scripts/extract_places.py kanto.osm.pbf tokyo -o build/tokyo-places-osm.json
+node scripts/build-places.mjs build/tokyo-places-osm.json tokyo   # data/tokyo-places.json.gz and data/tokyo-gazetteer.json.gz
 ```
 
 To use a new preset, add it to `PRESETS` in `src/main.js`.
+
+## Publishing as a claude.ai artifact
+
+`node scripts/build-artifact.mjs` writes `build/artifact/index.html`, the page in the shape the artifact host expects, and `build/artifact/files.json`, the scripts and data to publish beside it. Artifact pages may not call other sites, so this build runs on the bundled Tokyo data only, hides the share link and saves recorded videos through the viewer's `downloads` capability.
 
 ## Data
 

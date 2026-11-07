@@ -56,6 +56,7 @@ const meta = {
   bounds: [Math.round(b.minX), Math.round(b.minY), Math.round(b.maxX), Math.round(b.maxY)],
   outline,
   friends,
+  country: preset.country || '',
   roads: graph.nEdges,
   attribution: '© OpenStreetMap contributors',
 };

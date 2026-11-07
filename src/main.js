@@ -3,9 +3,11 @@ import { makeProjection, projectPolygons, geojsonPolygons, ringsBounds, ringsAre
 import { solveTogether, separateFloods, dijkstra } from './search.js';
 import { buildTimeline } from './timeline.js';
 import { Renderer, STAGE_W, STAGE_H, FONT_SANS, FONT_MONO } from './renderer.js';
-import { searchCities, lookupCity, geocode, placeName, landmarkName, overpassQuery, overpass } from './osm.js';
-import { CATEGORIES, placesQuery, rankPlaces } from './places.js';
+import { searchCities, lookupCity, geocode, placeName, landmarkName, overpassQuery, overpass, isLive, setOffline, stationName } from './osm.js';
+import { CATEGORIES, placesQuery, candidatesFrom, rankCandidates } from './places.js';
+import { loadBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from './offline.js';
 import { CanvasRecorder, recordingSupported } from './recorder.js';
+import { dataPath, fetchBytes } from './files.js';
 
 // One colour per friend, like the lines on a transit map.
 const LINE_COLORS = [
@@ -25,6 +27,10 @@ const canvas = $('stage');
 const renderer = new Renderer(canvas);
 renderer.nameOf = (f) => displayName(f);
 const lang = (navigator.language || 'en').slice(0, 2);
+// Published as a claude.ai artifact: the page may not call other sites, so
+// it runs on the bundled Tokyo data and saves files through the viewer.
+const EMBED = !!window.TEMPO_EMBED;
+if (EMBED) setOffline();
 
 const state = {
   city: null,
@@ -92,10 +98,7 @@ async function loadPreset(id) {
   setStatus(`Loading the ${PRESETS.find((p) => p.id === id)?.name || id} streets`);
   const [meta, buf] = await Promise.all([
     loadPresetMeta(id),
-    fetch(`data/${id}.tmpo`).then((r) => {
-      if (!r.ok) throw new Error(`Could not load data/${id}.tmpo (${r.status})`);
-      return r.arrayBuffer();
-    }),
+    fetchBytes(dataPath(`${id}.tmpo`)),
   ]);
   const graph = await decodeGraph(buf);
   setCity({ id, name: meta.name, outline: meta.outline, defaults: meta.friends }, graph);
@@ -245,6 +248,7 @@ async function ensureArea(friends) {
     if (state.city?.id !== preset) await loadPreset(preset);
     return;
   }
+  if (!isLive()) throw new Error('Only Tokyo\u2019s 23 wards can be loaded right now, so every starting point needs to be there.');
   // everyone in the same city: use its boundary when it is small enough for every street
   const city = mostCommon(friends.map((f) => f.city));
   if (city && friends.every((f) => f.city === city)) {
@@ -294,6 +298,44 @@ function setCity(city, graph) {
   state.graph = graph;
   state.outlineIndex = city.outline.length ? new PolygonIndex(city.outline) : null;
   renderer.setCity(city, graph);
+}
+
+// ---------------------------------------------------------------------------
+// bundled data, used for the preset city and whenever live services are out
+
+async function bundle() {
+  const id = PRESETS[0].id;
+  return loadBundle(id, await loadPresetMeta(id));
+}
+
+const onPreset = () => !!state.city && PRESETS.some((p) => p.id === state.city.id);
+
+/** Starting points by name: live search first, then the bundled list. */
+async function findPlace(q, near) {
+  if (isLive()) {
+    try {
+      const found = await geocode(q, near);
+      if (found.length) return found;
+    } catch (err) {
+      if (isLive()) throw err;
+    }
+  }
+  return searchGazetteer(await bundle(), q);
+}
+
+/** A short name for a point, from the bundle on the preset city. */
+async function nameForPoint(lat, lon, stale) {
+  if (onPreset()) return bundledPlaceName(await bundle(), lat, lon);
+  return placeName(lat, lon, stale);
+}
+
+async function meetLandmark(lat, lon, stale) {
+  if (onPreset()) return bundledLandmark(await bundle(), lat, lon, stationName);
+  return landmarkName(lat, lon, stale);
+}
+
+function showCoverage() {
+  $('coverage').hidden = isLive();
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +406,7 @@ async function lookupFriend(f, { quiet = false } = {}) {
   f.status = 'pending';
   renderFriends();
   try {
-    const results = await geocode(q, searchBias());
+    const results = await findPlace(q, searchBias());
     if (token !== f.token) return;
     if (!results.length) {
       Object.assign(f, { status: 'missing', alts: [] });
@@ -378,6 +420,7 @@ async function lookupFriend(f, { quiet = false } = {}) {
     f.status = 'error';
   }
   renderFriends();
+  showCoverage();
   if (!quiet) afterMove(f);
 }
 
@@ -408,7 +451,7 @@ function afterMove(f) {
 function fillPlaceName(f) {
   const token = ++f.token;
   const stale = () => f.token !== token || !state.friends.includes(f);
-  placeName(f.lat, f.lon, stale)
+  nameForPoint(f.lat, f.lon, stale)
     .then((r) => {
       if (stale() || !r.label) return;
       f.place = r.label;
@@ -491,7 +534,7 @@ function requestMeetName() {
   const [lon, lat] = meetLonLat();
   state.meetLookup = 'loading';
   renderResult();
-  landmarkName(lat, lon, () => token !== state.meetToken)
+  meetLandmark(lat, lon, () => token !== state.meetToken)
     .then((name) => {
       if (token !== state.meetToken) return;
       state.meetName = name;
@@ -519,10 +562,13 @@ async function loadPlaces() {
   state.places = null;
   renderPlaces();
   try {
-    const data = await overpass(placesQuery(lat, lon, 1200));
+    // the preset city carries its own places; elsewhere ask Overpass
+    const candidates = onPreset()
+      ? bundledPlacesNear(await bundle(), lat, lon, 1200, lang)
+      : candidatesFrom((await overpass(placesQuery(lat, lon, 1200))).elements || [], lang);
     if (token !== state.placesToken) return;
     const walk = dijkstra(state.graph, res.meet).dist;
-    state.places = rankPlaces(data.elements || [], { graph: state.graph, walk, lang });
+    state.places = rankCandidates(candidates, { graph: state.graph, walk });
     state.placesState = 'done';
   } catch (err) {
     if (token !== state.placesToken) return;
@@ -734,7 +780,7 @@ function renderFriends() {
     status.innerHTML = '';
     const text = document.createElement('span');
     if (f.status === 'pending') text.textContent = 'Looking up';
-    else if (f.status === 'missing') text.textContent = 'No match. Try adding the city.';
+    else if (f.status === 'missing') text.textContent = isLive() ? 'No match. Try adding the city.' : 'Not found. Try a station or neighbourhood in Tokyo.';
     else if (f.status === 'error') text.textContent = 'The place search is not answering. Try again in a moment.';
     else if (f.status === 'found') text.textContent = f.detail && f.detail !== f.query ? f.detail : '';
     else text.textContent = 'Neighbourhood, station or address';
@@ -1114,6 +1160,7 @@ async function finishRecording() {
   $('record').textContent = 'Record video';
   $('record').classList.remove('recording');
   const name = `tempo-${state.city.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meetup'}.${rec.ext}`;
+  if (EMBED) return saveThroughViewer(blob, name);
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1123,11 +1170,27 @@ async function finishRecording() {
   $('record-note').innerHTML = `Saved <a class="link" href="${url}" download="${name}">${name}</a>, ${(blob.size / 1e6).toFixed(1)} MB at 1080 × 1920`;
 }
 
+/** In an artifact the viewer saves files for the page, after asking. */
+async function saveThroughViewer(blob, name) {
+  const downloads = await window.claude?.use?.('downloads');
+  if (!downloads) {
+    setNote('record-note', 'Saving files is not available in this view.', true);
+    return;
+  }
+  try {
+    await downloads.save({ filename: name, data: blob });
+    setNote('record-note', `Saved ${name}, ${(blob.size / 1e6).toFixed(1)} MB at 1080 × 1920`);
+  } catch (err) {
+    if (err.code === 'declined') setNote('record-note', 'Not saved');
+    else setNote('record-note', `Could not save the video (${err.code || err.message}).`, true);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // shareable links: #area=tokyo&name=Tokyo&f=name,place,lat,lon;...
 
 function writeHash() {
-  if (!state.city || state.loading) return;
+  if (!state.city || state.loading || EMBED) return;
   const parts = [`area=${encodeURIComponent(state.city.id)}`, `name=${encodeURIComponent(state.city.name)}`];
   const list = state.friends.filter(located);
   parts.push(
@@ -1208,6 +1271,17 @@ async function start() {
   // two empty rows to type into, even if nothing else loads
   setFriends([{}, {}]);
   renderFriends();
+  if (EMBED) {
+    // links here cannot carry the meetup, and saving goes through the viewer
+    $('share').hidden = true;
+    window.claude?.use?.('downloads').then((d) => {
+      if (!d) {
+        $('record').hidden = true;
+        setNote('record-note', 'Recording a video is not available in this view.');
+      }
+    });
+  }
+  showCoverage();
   setStatus('Loading');
   await loadFonts();
   const hash = readHash();

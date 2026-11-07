@@ -38,7 +38,9 @@ button, input, select { font: inherit; color: inherit; }
   grid-template-columns: auto minmax(340px, 420px);
   justify-content: center;
   gap: 32px;
-  padding: 24px;
+  padding-block: 24px;
+  padding-left: max(24px, env(safe-area-inset-left, 0px));
+  padding-right: max(24px, env(safe-area-inset-right, 0px));
   min-height: 100vh;
 }
 
@@ -203,6 +205,7 @@ a.meta:hover { color: var(--text-1); }
 }
 
 .note:empty { display: none; }
+.note.coverage { margin: 0 0 12px; }
 .note.error { color: var(--text-1); }
 .note.error { display: flex; gap: 8px; }
 .note.error::before { content: ""; flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 2px; background: var(--negative); }
@@ -607,7 +610,9 @@ input[type="text"]:focus-visible { outline-offset: 0; }
   .app {
     grid-template-columns: minmax(0, 1fr);
     gap: 16px;
-    padding: 16px;
+    padding-block: 16px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
   }
 
   .stage-col { position: static; }

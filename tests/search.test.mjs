@@ -6,6 +6,7 @@ import { dijkstra, meetSearch, solve, tracePath } from '../src/search.js';
 import { buildGraph } from '../src/graph.js';
 import { makeProjection, PolygonIndex, simplifyFlat, landOutline, ringsArea } from '../src/geo.js';
 import { classify, rankPlaces } from '../src/places.js';
+import { makeBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from '../src/offline.js';
 
 // deterministic PRNG
 function rng(seed) {
@@ -237,6 +238,37 @@ test('places are ranked by walking distance on the road graph', () => {
   // a well known park beats a slightly closer plain one
   assert.deepEqual(groups.chill.map((p) => p.name), ['Famous Park', 'Park']);
   assert.deepEqual(groups.activity, []);
+});
+
+test('offline search finds stations, spelling variants and nearby names', () => {
+  const b = makeBundle('x', { name: 'Testville', country: 'Nowhere' }, {
+    kinds: ['chill\tPark', 'eat\tRamen'],
+    items: [
+      [3500100, 13900100, 0, '中央公園', 'Central Park', 4 | 1, 'w1', 50000],
+      [3500000, 13900000, 1, 'ラーメン', '', 2, 'n2', 0],
+    ],
+  }, {
+    items: [
+      [3500000, 13900000, 's', '中目黒', 'Naka-meguro', ''],
+      [3500050, 13900050, 's', '中目黒', 'Naka-meguro', ''], // same station, another line
+      [3502000, 13902000, 'n', '中目黒一丁目', 'Nakameguro 1', ''],
+      [3510000, 13910000, 'l', '東京タワー', 'Tokyo Tower', ''],
+    ],
+  });
+  const naka = searchGazetteer(b, 'Nakameguro station');
+  assert.equal(naka[0].label, 'Naka-meguro');
+  assert.equal(naka[0].detail, 'Naka-meguro, station in Testville');
+  assert.equal(naka.filter((r) => r.label === 'Naka-meguro').length, 1);
+  assert.equal(searchGazetteer(b, '東京タワー')[0].label, 'Tokyo Tower');
+  assert.deepEqual(searchGazetteer(b, 'Paris'), []);
+  assert.equal(bundledPlaceName(b, 35.0201, 139.0201).label, 'Nakameguro 1');
+  assert.equal(bundledLandmark(b, 35.0001, 139.0001, (n) => `${n} Station`), 'Naka-meguro Station');
+  const near = bundledPlacesNear(b, 35, 139, 500);
+  assert.deepEqual(near.map((p) => [p.id, p.category, p.kind, p.name]), [
+    ['way/1', 'chill', 'Park', 'Central Park'],
+    ['node/2', 'eat', 'Ramen', 'ラーメン'],
+  ]);
+  assert.equal(near[0].notable && near[0].park, true);
 });
 
 const tokyo = new URL('../data/tokyo.tmpo', import.meta.url);

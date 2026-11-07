@@ -161,7 +161,7 @@ export function classify(tags) {
   return null;
 }
 
-function position(el) {
+export function position(el) {
   if (el.lat != null && el.lon != null) return [el.lat, el.lon, 0];
   if (el.center) return [el.center.lat, el.center.lon, 0];
   if (el.bounds) {
@@ -176,6 +176,41 @@ function position(el) {
 }
 
 /**
+ * Turns Overpass elements into place candidates:
+ * { id, category, kind, name, lat, lon, area, notable, details }.
+ */
+export function candidatesFrom(elements, lang = 'en') {
+  const out = [];
+  const seen = new Set();
+  for (const el of elements) {
+    const tags = el.tags || {};
+    const cls = classify(tags);
+    if (!cls) continue;
+    const pos = position(el);
+    if (!pos) continue;
+    const id = `${el.type}/${el.id}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const [lat, lon, area] = pos;
+    out.push({
+      id,
+      category: cls.category,
+      kind: cls.kind,
+      name: tags[`name:${lang}`] || tags.name,
+      nameLocal: tags.name,
+      nameEn: tags['name:en'] || '',
+      lat,
+      lon,
+      area,
+      notable: notable(tags),
+      details: !!(tags.website || tags['contact:website'] || tags.opening_hours),
+      park: tags.leisure === 'park' || tags.leisure === 'garden' || tags.leisure === 'nature_reserve',
+    });
+  }
+  return out;
+}
+
+/**
  * Ranks Overpass elements into the four groups.
  *
  * @param {Array} elements      Overpass elements with tags and a position
@@ -185,20 +220,15 @@ function position(el) {
  * @param {string} [opts.lang]  preferred language for names, like "en"
  * @param {number} [opts.limit] places per group
  */
-export function rankPlaces(elements, { graph, walk, lang = 'en', limit = 5 }) {
-  const groups = Object.fromEntries(CATEGORIES.map((c) => [c.id, []]));
-  const seen = new Set();
-  for (const el of elements) {
-    const tags = el.tags || {};
-    const cls = classify(tags);
-    if (!cls) continue;
-    const pos = position(el);
-    if (!pos) continue;
-    const [lat, lon, area] = pos;
-    const id = `${el.type}/${el.id}`;
-    if (seen.has(id)) continue;
-    seen.add(id);
+export function rankPlaces(elements, opts) {
+  return rankCandidates(candidatesFrom(elements, opts.lang), opts);
+}
 
+/** Ranks place candidates into the four groups by walking distance. */
+export function rankCandidates(candidates, { graph, walk, limit = 5 }) {
+  const groups = Object.fromEntries(CATEGORIES.map((c) => [c.id, []]));
+  for (const p of candidates) {
+    const { lat, lon, area } = p;
     const [x, y] = graph.proj.fwd(lon, lat);
     const node = graph.grid.nearest(x, y);
     const toRoad = Math.hypot(graph.nodeX[node] - x, graph.nodeY[node] - y);
@@ -208,23 +238,21 @@ export function rankPlaces(elements, { graph, walk, lang = 'en', limit = 5 }) {
     if (metres > 2500) continue;
 
     let boost = 1;
-    if (notable(tags)) boost += 1.2;
-    if (tags.website || tags['contact:website'] || tags.opening_hours) boost += 0.2;
-    if (area > 2000 && (tags.leisure === 'park' || tags.leisure === 'garden' || tags.leisure === 'nature_reserve')) {
-      boost += Math.min(2, Math.log10(area / 2000)) * 0.6;
-    }
+    if (p.notable) boost += 1.2;
+    if (p.details) boost += 0.2;
+    if (p.park && area > 2000) boost += Math.min(2, Math.log10(area / 2000)) * 0.6;
 
-    groups[cls.category].push({
-      id,
-      name: tags[`name:${lang}`] || tags.name,
-      kind: cls.kind,
+    groups[p.category].push({
+      id: p.id,
+      name: p.name,
+      kind: p.kind,
       lat,
       lon,
       metres,
       minutes: Math.max(1, Math.round(metres / WALK_M_PER_MIN)),
-      notable: notable(tags),
+      notable: p.notable,
       score: metres / boost,
-      url: `https://www.openstreetmap.org/${el.type}/${el.id}`,
+      url: `https://www.openstreetmap.org/${p.id}`,
     });
   }
 
