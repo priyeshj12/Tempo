@@ -1,0 +1,4 @@
+node_modules/
+build/
+*.pbf
+.DS_Store
