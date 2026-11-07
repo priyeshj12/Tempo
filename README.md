@@ -1,50 +1,56 @@
 # Tempo
 
-**Where should your friends meet?** Drop friends anywhere in a city and Tempo floods the real road network from each of them to find the fairest place to meet. The animation shows why searching *all at once* beats searching *one by one*, and you can record it as a 9:16 video.
+**Where should your friends meet?** Add where each friend is starting from. Tempo spreads out from each of them along real streets, finds the spot where the longest trip is as short as it can be, and suggests where to eat, what to do, what to see and where to sit back once you are there. The whole thing plays as a 9:16 animation you can record and share.
 
 <p>
-  <img src="docs/one-by-one.jpg" width="270" alt="One by one: a friend's search floods all of Tokyo">
-  <img src="docs/preview.jpg" width="270" alt="All at once: four floods meet near Shibaura-futo Station">
+  <img src="docs/one-by-one.jpg" width="270" alt="One by one: one friend's search spreads across every street in Tokyo">
+  <img src="docs/preview.jpg" width="270" alt="All at once: four friends meet around Shibaura-futo Station, with a place to eat, an activity, a sight and a park listed under the map">
 </p>
 
-## What it does
+## How it works
 
-1. **One by one.** A full Dijkstra search from each friend. Without knowing where everyone will end up, every search has to cover the whole city: 4 × 188,870 = 755,480 roads in Tokyo.
-2. **All at once.** The four searches take turns, always growing whichever front is closest. The first junction every flood has reached is the place that keeps the *longest* trip as short as possible, so the search stops right there. In Tokyo that is 271,077 roads, 64% fewer.
-3. **Meet.** The meeting point is named from a nearby station or park (via Nominatim), and each friend's route and distance is drawn.
+1. **Starting points.** Type a neighbourhood, station or address for each friend, 2 to 12 of them. Places are found with Nominatim; if the first match is wrong, "Not this one" offers the others.
+2. **The area.** If everyone is inside a bundled city (Tokyo's 23 wards), its streets load at once. If everyone is in the same city, its boundary is used. Otherwise Tempo downloads the streets in a box around everyone from the Overpass API, with more or less detail depending on the size.
+3. **One by one.** A full Dijkstra search from each friend. Without knowing where everyone will end up, each search has to cover the whole map.
+4. **All at once.** The searches take turns, always growing whichever front is closest. The first junction every flood reaches is where the longest trip is as short as possible, so the search stops there. In the Tokyo example that checks 64% fewer roads.
+5. **Where to meet.** The searches carry on a little further to light up every street where nobody travels more than about 6% further (250 m to 1.5 km), so you can pick any spot in that zone. The centre is named after the closest station or park.
+6. **Things to do.** Named places within a short walk come from OpenStreetMap in four groups: Eat, Activity, Sightseeing and Chill. They are ranked by walking distance along the streets, with a nudge towards well known places and bigger parks, and the top pick of each group appears in the video.
 
-## Features
+## Using it
 
-- Tokyo's 23 wards are bundled (188k road segments, 2.5 MB), so the default view loads without downloading roads.
-- **Any other city** loads live: search for it, and its roads come from the Overpass API and are built into a graph in a Web Worker. Detail is chosen from the city's size (all streets, main roads or major roads).
-- 2 to 6 friends: drag markers, or select a friend and click the map, or search for a place by name. Names and place labels are editable.
-- Timeline scrubber, 0.5× to 2× speed, and an option to skip the one-by-one phase.
-- **Record video**: saves the animation as a 1080×1920 MP4 or WebM from the browser.
-- **Copy link**: the URL keeps the city and every friend, so a shared link reopens the same scene.
+- Drag a friend's marker on the map, or select their line colour in the list and click the map, to fine tune where they start.
+- The timeline can be scrubbed and played at 0.5× to 2×, with or without the one-by-one phase.
+- **Record video** saves a 1080 × 1920 MP4 or WebM.
+- **Copy link** keeps the area and every starting point, so a shared link opens the same meetup.
 
 ## Running it
 
-It is a static site with no build step and no dependencies.
+A static site with no build step and no dependencies.
 
 ```sh
 npm start          # serves on http://localhost:8000 (or: python3 -m http.server)
 npm test           # unit tests (Node 20+)
 ```
 
-Any static host works, including GitHub Pages. Loading other cities needs the browser to reach `nominatim.openstreetmap.org` and the Overpass API.
+Any static host works, including GitHub Pages. Finding places and loading areas other than Tokyo needs the browser to reach `nominatim.openstreetmap.org` and the Overpass API.
 
-## How the code is laid out
+## Code
 
 | File | Purpose |
 | --- | --- |
-| `src/graph.js` | Builds an intersection-to-intersection road graph from OSM ways, binary (de)serialisation, nearest-node grid |
-| `src/search.js` | Dijkstra, the simultaneous multi-source search, and `Flood` replay data |
+| `src/main.js` | App state, starting points, choosing the area, results, sharing and recording |
+| `src/search.js` | Dijkstra, the simultaneous multi-source search with its meeting zone, and `Flood` replay data |
+| `src/places.js` | The Overpass query for places, their four groups and ranking by walking distance |
+| `src/graph.js` | Builds an intersection-to-intersection road graph from OSM ways, binary format, nearest-node grid |
+| `src/renderer.js` | Canvas rendering: streets, floods, wavefronts, line-coloured routes, the meeting point and captions |
 | `src/timeline.js` | The sequence of phases and what each frame shows |
-| `src/renderer.js` | Canvas rendering: base map, incremental flood layers, glowing wavefronts, markers, routes, captions |
 | `src/geo.js` | Projection, simplification, point-in-polygon index, shore-hugging outline tracing |
-| `src/osm.js` | Nominatim (rate limited to 1 request/second) and Overpass queries |
-| `src/worker.js` | Downloads and builds other cities off the main thread |
-| `src/main.js` | App state, UI, interaction, sharing and recording |
+| `src/osm.js` | Nominatim (one request a second, as its policy asks) and Overpass |
+| `src/worker.js` | Downloads and builds new areas off the main thread |
+
+## Design
+
+The interface follows a "city transit map at night" direction: ink neutrals, streets in dim sodium amber, each friend a transit line colour, and the meeting point drawn as an interchange. Amber is kept for the few things that matter: the road count, the longest trip and the meeting zone. The visual pass followed [unslop](https://github.com/heydamir/unslop) by Damir Sokolovsky ([@heydamir](https://x.com/heydamir)), CC BY 4.0.
 
 ## Rebuilding or adding a bundled city
 
@@ -57,7 +63,7 @@ python3 scripts/extract_osm.py kanto.osm.pbf tokyo -o build/tokyo-osm.json
 node scripts/build-preset.mjs build/tokyo-osm.json   # writes data/tokyo.tmpo and data/tokyo.json
 ```
 
-To show a new preset in the app, add it to `PRESETS` in `src/main.js`.
+To use a new preset, add it to `PRESETS` in `src/main.js`.
 
 ## Data
 

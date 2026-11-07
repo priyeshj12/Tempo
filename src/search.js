@@ -100,18 +100,24 @@ export function dijkstra(g, source) {
 }
 
 /**
- * Simultaneous search from all sources; stops at the first node settled by
- * every one of them.
+ * Simultaneous search from all sources. The first node settled by every one
+ * of them is the meeting point. With `slack`, the floods carry on a little
+ * further to find the meeting zone: every node where the longest trip is at
+ * most `radius + slack(radius)`.
  *
+ * @param {object} [opts]
+ * @param {function} [opts.slack]  radius -> extra metres for the zone
  * @returns {{
  *   meet: number,            node index of the meeting point (-1 if none)
  *   radius: number,          the longest trip to it, in metres
  *   firstCross: number,      radius at which two floods first touched
+ *   zone: Uint32Array,       nodes within the zone limit (includes meet)
+ *   zoneLimit: number,       longest trip allowed inside the zone
  *   dist: Float64Array[],    per source; Infinity beyond what it settled
  *   pred: Int32Array[],
  * }}
  */
-export function meetSearch(g, sources) {
+export function meetSearch(g, sources, { slack = null } = {}) {
   const k = sources.length;
   const n = g.nNodes;
   const dist = sources.map(() => new Float64Array(n).fill(Infinity));
@@ -129,7 +135,9 @@ export function meetSearch(g, sources) {
   let meet = -1;
   let radius = Infinity;
   let firstCross = Infinity;
+  let limit = Infinity;
   while (heap.size) {
+    if (heap.keys[0] > limit) break;
     const item = heap.pop();
     const d = heap.topKey;
     const u = (item / k) | 0;
@@ -139,10 +147,11 @@ export function meetSearch(g, sources) {
     doneI[u] = 1;
     const c = ++settledBy[u];
     if (c === 2 && firstCross === Infinity) firstCross = d;
-    if (c === k) {
+    if (c === k && meet < 0) {
       meet = u;
       radius = d;
-      break;
+      limit = d + (slack ? Math.max(0, slack(d)) : 0);
+      if (!slack) break;
     }
     const distI = dist[i];
     const predI = pred[i];
@@ -165,7 +174,22 @@ export function meetSearch(g, sources) {
     const doneI = done[i];
     for (let v = 0; v < n; v++) if (!doneI[v]) di[v] = Infinity;
   }
-  return { meet, radius, firstCross, dist, pred };
+
+  const zone = [];
+  if (meet >= 0) {
+    for (let v = 0; v < n; v++) {
+      if (settledBy[v] !== k) continue;
+      let worst = 0;
+      for (let i = 0; i < k; i++) if (dist[i][v] > worst) worst = dist[i][v];
+      if (worst <= limit) zone.push(v);
+    }
+  }
+  return { meet, radius, firstCross, zone: Uint32Array.from(zone), zoneLimit: meet >= 0 ? limit : Infinity, dist, pred };
+}
+
+/** Extra distance that still counts as "about as fair": 6%, 250 m to 1.5 km. */
+export function zoneSlack(radius) {
+  return Math.min(1500, Math.max(250, radius * 0.06));
 }
 
 /** Node sequence and polyline (flat x,y) from source to target via pred edges. */
@@ -297,13 +321,23 @@ export function upperBound(arr, x) {
  * the one-by-one phase.
  */
 export function solveTogether(g, sources) {
-  const meet = meetSearch(g, sources);
+  const meet = meetSearch(g, sources, { slack: zoneSlack });
   const together = sources.map((_, i) => new Flood(g, meet.dist[i], meet.radius));
   const paths = meet.meet >= 0 ? sources.map((_, i) => tracePath(g, meet.pred[i], meet.meet)) : [];
+
+  // streets of the meeting zone: both ends inside it
+  const inZone = new Uint8Array(g.nNodes);
+  for (const v of meet.zone) inZone[v] = 1;
+  const zoneEdges = [];
+  for (let e = 0; e < g.nEdges; e++) if (inZone[g.edgeU[e]] && inZone[g.edgeV[e]]) zoneEdges.push(e);
+
   return {
     meet: meet.meet,
     radius: meet.radius,
     firstCross: meet.firstCross,
+    zone: meet.zone,
+    zoneLimit: meet.zoneLimit,
+    zoneEdges: Uint32Array.from(zoneEdges),
     together,
     separate: [],
     paths,

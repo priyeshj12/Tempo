@@ -5,12 +5,19 @@ export const STAGE_W = 1080;
 export const STAGE_H = 1920;
 const MAP = { x: 50, y: 330, w: 980, h: 1300 };
 
-export const FONT_SANS = '"Inter", "Segoe UI", system-ui, -apple-system, sans-serif';
-export const FONT_MONO = '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace';
+export const FONT_SANS = '"Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif';
+export const FONT_MONO = '"Geist Mono", ui-monospace, "SF Mono", Menlo, monospace';
 
-const BASE_ROAD = 'rgba(176, 128, 74, 0.30)';
-const OUTLINE = 'rgba(255, 176, 72, 0.85)';
-const OUTLINE_GLOW = 'rgba(255, 150, 40, 0.16)';
+// Ink ramp for a city at night; streets in dim sodium light.
+const INK_DEEP = '#07080d';
+const INK_CARD = 'rgba(17, 20, 28, 0.94)';
+const TEXT1 = '#eef0f5';
+const TEXT2 = '#a3a9b8';
+const TEXT3 = '#7a8296';
+const HAIRLINE = 'rgba(238, 240, 245, 0.12)';
+export const ACCENT = '#f2a541';
+const BASE_ROAD = 'rgba(232, 168, 92, 0.22)';
+const OUTLINE = 'rgba(242, 165, 65, 0.5)';
 
 export function hexToRgb(hex) {
   const n = parseInt(hex.slice(1), 16);
@@ -27,12 +34,8 @@ const smooth = (x) => {
   x = clamp01(x);
   return x * x * (3 - 2 * x);
 };
-const easeOutBack = (x) => {
-  x = clamp01(x);
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return 1 + c3 * (x - 1) ** 3 + c1 * (x - 1) ** 2;
-};
+// one ease-out curve for everything, close to cubic-bezier(0.22, 1, 0.36, 1)
+const easeOut = (x) => 1 - (1 - clamp01(x)) ** 4;
 
 function makeLayer() {
   const c = document.createElement('canvas');
@@ -239,6 +242,7 @@ export class Renderer {
     this.glow.width = STAGE_W / 4;
     this.glow.height = STAGE_H / 4;
     this.view = null;
+    this.nameOf = (f) => f.name;
   }
 
   /** New city: fit, precompute screen geometry and paint the base layer. */
@@ -279,7 +283,7 @@ export class Renderer {
       }
       outline.closePath();
     }
-    ctx.fillStyle = 'rgba(255, 170, 70, 0.025)';
+    ctx.fillStyle = 'rgba(238, 240, 245, 0.015)';
     ctx.fill(outline, 'evenodd');
 
     const roads = new Path2D();
@@ -290,11 +294,8 @@ export class Renderer {
     ctx.stroke(roads);
 
     ctx.lineJoin = 'round';
-    ctx.strokeStyle = OUTLINE_GLOW;
-    ctx.lineWidth = 14;
-    ctx.stroke(outline);
     ctx.strokeStyle = OUTLINE;
-    ctx.lineWidth = 2.6;
+    ctx.lineWidth = 2;
     ctx.stroke(outline);
   }
 
@@ -390,7 +391,7 @@ export class Renderer {
     ctx.save();
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
-    ctx.fillStyle = '#000';
+    ctx.fillStyle = INK_DEEP;
     ctx.fillRect(0, 0, STAGE_W, STAGE_H);
     if (!this.view) {
       ctx.restore();
@@ -434,22 +435,41 @@ export class Renderer {
         ctx.restore();
       }
 
-      if (st.meetIn > 0) this.drawMeetRing(ctx, st);
+      if (st.meetIn > 0) this.drawZone(ctx, st.meetIn);
       if (st.routes > 0) this.drawRoutes(ctx, st.routes);
     }
 
     this.drawFriends(ctx, st, ui);
-    if (st && st.meetIn > 0) this.drawMeetPin(ctx, st, ui.meetName);
+    if (st && st.meetIn > 0) this.drawMeet(ctx, st, ui.meetName);
     this.drawCaptions(ctx, st, ui);
     ctx.restore();
   }
 
+  /** Streets where every trip stays close to the fairest, lit in amber. */
+  drawZone(ctx, k) {
+    const edges = this.result.zoneEdges;
+    if (!edges || !edges.length) return;
+    const path = new Path2D();
+    for (const e of edges) this.geo.addEdge(path, e);
+    ctx.save();
+    ctx.globalAlpha = smooth(k);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = INK_DEEP;
+    ctx.lineWidth = 9;
+    ctx.stroke(path);
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 4.5;
+    ctx.stroke(path);
+    ctx.restore();
+  }
+
+  /** Each friend's route as a flat transit line with a dark casing. */
   drawRoutes(ctx, progress) {
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     this.routes.forEach((route, i) => {
-      const rgb = hexToRgb(this.friends[i].color);
       const path = new Path2D();
       const target = route.len * smooth(progress);
       const p = route.pts;
@@ -465,148 +485,114 @@ export class Renderer {
         path.lineTo(p[k], p[k + 1]);
         acc += d;
       }
-      ctx.strokeStyle = rgba(rgb, 0.28);
-      ctx.lineWidth = 30;
+      ctx.strokeStyle = INK_DEEP;
+      ctx.lineWidth = 17;
       ctx.stroke(path);
-      ctx.strokeStyle = rgba(rgb, 0.95);
-      ctx.lineWidth = 11;
-      ctx.stroke(path);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.lineWidth = 4;
+      ctx.strokeStyle = this.friends[i].color;
+      ctx.lineWidth = 10;
       ctx.stroke(path);
     });
     ctx.restore();
   }
 
   meetScreen() {
-    const g = this.graph;
     const m = this.result.meet;
     return [this.geo.nx[m], this.geo.ny[m]];
   }
 
-  drawMeetRing(ctx, st) {
+  /** Where the station sign under the meeting point goes. */
+  meetSign(ctx, name) {
     const [x, y] = this.meetScreen();
-    const pulse = (st.t * 0.9) % 1;
     ctx.save();
-    ctx.strokeStyle = `rgba(255,255,255,${0.55 * (1 - pulse) * st.meetIn})`;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(x, y, 14 + pulse * 46, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.font = `500 30px ${FONT_SANS}`;
+    const label = name || 'Fairest point';
+    const w = ctx.measureText(label).width + 32;
     ctx.restore();
+    const h = 52;
+    return { label, x: Math.max(16, Math.min(STAGE_W - 16 - w, x - w / 2)), y: y + 40, w, h };
   }
 
-  drawMeetPin(ctx, st, name) {
+  /** The meeting point, drawn like an interchange where every line arrives. */
+  drawMeet(ctx, st, name) {
     const [x, y] = this.meetScreen();
-    const k = easeOutBack(st.meetIn);
+    const k = easeOut(st.meetIn);
     ctx.save();
-    // avatars above the pin
-    const n = this.friends.length;
-    const r = 17;
-    const gap = 30;
-    const ay = y - 108 * k;
-    ctx.globalAlpha = clamp01(st.meetIn * 2);
-    this.friends.forEach((f, i) => {
-      const ax = x + (i - (n - 1) / 2) * gap;
-      drawAvatar(ctx, ax, ay, r * k, f.color, 0.9);
-    });
-    // pin
-    ctx.translate(x, y);
-    ctx.scale(k, k);
-    ctx.shadowColor = 'rgba(0,0,0,0.6)';
-    ctx.shadowBlur = 14;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.bezierCurveTo(-8, -14, -24, -28, -24, -46);
-    ctx.arc(0, -46, 24, Math.PI, 0);
-    ctx.bezierCurveTo(24, -28, 8, -14, 0, 0);
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    // cup glyph
-    ctx.fillStyle = '#111';
-    ctx.beginPath();
-    ctx.roundRect(-11, -56, 17, 16, [0, 0, 6, 6]);
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#111';
-    ctx.beginPath();
-    ctx.arc(8, -49, 4.5, -Math.PI / 2, Math.PI / 2);
-    ctx.stroke();
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(-6, -60);
-    ctx.quadraticCurveTo(-3, -64, -6, -68);
-    ctx.moveTo(1, -60);
-    ctx.quadraticCurveTo(4, -64, 1, -68);
-    ctx.stroke();
+    ctx.globalAlpha = clamp01(st.meetIn * 1.5);
+    for (const [r, c] of [[30, INK_DEEP], [25, TEXT1], [17, INK_DEEP], [9, TEXT1]]) {
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      ctx.arc(x, y, r * k, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.restore();
 
-    // name tag under the pin
-    if (name) {
-      ctx.save();
-      ctx.globalAlpha = clamp01((st.meetIn - 0.3) / 0.7);
-      ctx.font = `800 30px ${FONT_SANS}`;
-      drawTag(ctx, name, x, y + 34, {
-        fill: '#fff',
-        text: '#0a0a0f',
-        stroke: null,
-        padX: 16,
-        h: 48,
-      });
-      ctx.restore();
-    }
+    const sign = this.meetSign(ctx, name);
+    ctx.save();
+    ctx.globalAlpha = clamp01((st.meetIn - 0.3) / 0.7);
+    ctx.fillStyle = TEXT1;
+    ctx.beginPath();
+    ctx.roundRect(sign.x, sign.y, sign.w, sign.h, 8);
+    ctx.fill();
+    ctx.font = `500 30px ${FONT_SANS}`;
+    ctx.fillStyle = INK_DEEP;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(sign.label, sign.x + 16, sign.y + sign.h / 2 + 1);
+    ctx.restore();
   }
 
   drawFriends(ctx, st, ui) {
     if (!this.friends || !this.geo) return;
-    const showDist = st && st.routes >= 0.98;
+    const showDist = st && st.routes >= 0.98 && this.result;
     const shown = [];
     this.friends.forEach((f, i) => {
       if (f.node == null || f.node < 0) return;
       const x = this.geo.nx[f.node];
       const y = this.geo.ny[f.node];
-      const pop = st ? easeOutBack(st.pop[i] ?? 1) : 1;
+      const pop = st ? easeOut(st.pop[i] ?? 1) : 1;
       if (pop <= 0.001) return;
       const selected = ui.selected === i;
-      const rad = (selected ? 36 : 31) * pop;
-      ctx.save();
       if (selected) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+        ctx.save();
+        ctx.strokeStyle = TEXT1;
         ctx.setLineDash([6, 6]);
         ctx.lineWidth = 2.5;
         ctx.beginPath();
-        ctx.arc(x, y, rad + 11, 0, Math.PI * 2);
+        ctx.arc(x, y, 28, 0, Math.PI * 2);
         ctx.stroke();
-        ctx.setLineDash([]);
+        ctx.restore();
       }
-      drawAvatar(ctx, x, y, rad, f.color, 1);
-      ctx.restore();
-      shown.push({ f, i, x, y, rad });
+      drawTerminus(ctx, x, y, 16 * pop, f.color);
+      shown.push({ f, i, x, y, rad: selected ? 30 : 20 });
     });
 
-    // labels go on top of every marker, placed to avoid each other
-    ctx.save();
-    ctx.font = `700 25px ${FONT_SANS}`;
-    const H = 38;
-    const pad = 12;
+    // station-name plates, placed so they avoid each other and the markers
+    const H = 44;
+    const PAD = 12;
+    const CHIP = 6;
     const taken = shown.map((m) => ({ x: m.x - m.rad, y: m.y - m.rad, w: m.rad * 2, h: m.rad * 2, owner: m.i }));
     if (st && st.meetIn > 0 && this.result && this.result.meet >= 0) {
       const [mx, my] = this.meetScreen();
-      taken.push({ x: mx - 70, y: my - 130, w: 140, h: 190, owner: -1 });
+      const sign = this.meetSign(ctx, ui.meetName);
+      taken.push({ x: mx - 32, y: my - 32, w: 64, h: 64, owner: -1 }, { ...sign, owner: -1 });
     }
+    ctx.save();
     for (const m of shown) {
       const { f, i, x, y, rad } = m;
-      const label = showDist && this.result
-        ? `${f.name} · ${(this.result.paths[i].length / 1000).toFixed(1)} km`
-        : f.place ? `${f.name} · ${f.place}` : f.name;
-      const w = ctx.measureText(label).width + pad * 2;
+      const name = this.nameOf(f);
+      const detail = showDist ? `${(this.result.paths[i].length / 1000).toFixed(1)} km` : f.place || '';
+      ctx.font = `500 25px ${FONT_SANS}`;
+      const wName = ctx.measureText(name).width;
+      ctx.font = showDist ? `500 23px ${FONT_MONO}` : `400 23px ${FONT_SANS}`;
+      const wDetail = detail ? ctx.measureText(detail).width : 0;
+      const w = PAD + CHIP + 10 + wName + (detail ? 10 + wDetail : 0) + PAD;
       const spots = [
-        [x, y - rad - 14 - H / 2],
-        [x, y + rad + 14 + H / 2],
-        [x + rad + 12 + w / 2, y],
-        [x - rad - 12 - w / 2, y],
-        [x, y - rad - 24 - H * 1.5],
+        [x, y - rad - 8 - H / 2],
+        [x, y + rad + 8 + H / 2],
+        [x + rad + 8 + w / 2, y],
+        [x - rad - 8 - w / 2, y],
+        [x, y - rad - 16 - H * 1.5],
+        [x, y + rad + 16 + H * 1.5],
       ];
       let best = null;
       let bestOverlap = Infinity;
@@ -622,116 +608,161 @@ export class Renderer {
         }
         if (overlap < bestOverlap) {
           bestOverlap = overlap;
-          best = { cx, cy, r };
+          best = r;
         }
         if (overlap === 0) break;
       }
-      taken.push({ ...best.r, owner: i });
-      const rgb = hexToRgb(f.color);
+      taken.push({ ...best, owner: i });
+
       ctx.globalAlpha = clamp01((st ? st.pop[i] ?? 1 : 1) * 1.4 - 0.4);
-      drawTag(ctx, label, best.cx, best.cy, {
-        fill: 'rgba(8, 8, 12, 0.88)',
-        text: rgba(mix(rgb, [255, 255, 255], 0.25), 1),
-        stroke: rgba(rgb, 0.95),
-        padX: pad,
-        h: H,
-      });
+      ctx.beginPath();
+      ctx.roundRect(best.x, best.y, best.w, best.h, 8);
+      ctx.fillStyle = INK_CARD;
+      ctx.fill();
+      ctx.strokeStyle = HAIRLINE;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = f.color;
+      ctx.beginPath();
+      ctx.roundRect(best.x + PAD, best.y + 11, CHIP, H - 22, 2);
+      ctx.fill();
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const ty = best.y + H / 2 + 1;
+      let tx = best.x + PAD + CHIP + 10;
+      ctx.font = `500 25px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT1;
+      ctx.fillText(name, tx, ty);
+      if (detail) {
+        tx += wName + 10;
+        ctx.font = showDist ? `500 23px ${FONT_MONO}` : `400 23px ${FONT_SANS}`;
+        ctx.fillStyle = TEXT2;
+        ctx.fillText(detail, tx, ty);
+      }
     }
+    ctx.restore();
+  }
+
+  /** Bottom of the drawn map, in stage pixels. */
+  mapBottom() {
+    return this.view.oy - this.city.outlineBounds.minY * this.view.s;
+  }
+
+  /** One suggestion per kind of outing, in the space under the map. */
+  drawPicks(ctx, picks, alpha) {
+    const top = Math.max(this.mapBottom() + 40, 1480);
+    if (top + 88 > 1640) return;
+    const L = 56;
+    const colW = (STAGE_W - L * 2 - 24 * (picks.length - 1)) / picks.length;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    picks.forEach((p, i) => {
+      const x = L + i * (colW + 24);
+      ctx.font = `400 22px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT3;
+      ctx.fillText(p.label, x, top + 22);
+      ctx.font = `500 26px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT1;
+      ctx.fillText(ellipsize(ctx, p.name, colW), x, top + 58);
+      ctx.font = `400 22px ${FONT_MONO}`;
+      ctx.fillStyle = TEXT2;
+      ctx.fillText(`${p.minutes} min walk`, x, top + 88);
+    });
     ctx.restore();
   }
 
   drawCaptions(ctx, st, ui) {
     ctx.save();
     ctx.textBaseline = 'alphabetic';
-
-    // wordmark
-    ctx.font = `800 30px ${FONT_SANS}`;
     ctx.textAlign = 'left';
-    const wm = ctx.createLinearGradient(56, 0, 200, 0);
-    wm.addColorStop(0, '#5ee7ff');
-    wm.addColorStop(1, '#a98bff');
-    ctx.fillStyle = wm;
-    ctx.beginPath();
-    ctx.arc(66, 96, 9, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillText('tempo', 84, 106);
+    const L = 56;
+    const R = STAGE_W - 56;
 
-    const n = this.friends ? this.friends.length : 0;
-    const cx = STAGE_W / 2;
-    if (!st || st.phase === 'intro' || st.phase === 'edit') {
-      ctx.font = `800 62px ${FONT_SANS}`;
-      ctx.textAlign = 'center';
-      const text = `Where should ${n} friends meet?`;
-      const w = ctx.measureText(text).width;
-      const grad = ctx.createLinearGradient(cx - w / 2, 0, cx + w / 2, 0);
-      grad.addColorStop(0, '#46e0ff');
-      grad.addColorStop(1, '#a67cff');
-      ctx.fillStyle = grad;
-      fitText(ctx, text, cx, 212, STAGE_W - 80);
-      if (ui.hint) {
-        ctx.font = `600 32px ${FONT_SANS}`;
-        ctx.fillStyle = 'rgba(255,255,255,0.75)';
-        fitText(ctx, ui.hint, cx, 270, STAGE_W - 100);
-      }
+    ctx.font = `500 30px ${FONT_SANS}`;
+    ctx.fillStyle = TEXT2;
+    ctx.fillText('Tempo', L, 104);
+
+    const friends = this.friends || [];
+    if (!st || st.phase === 'intro') {
+      ctx.font = `500 60px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT1;
+      fitText(ctx, `Where should ${friends.length} friends meet?`, L, 196, R - L);
+      ctx.font = `400 32px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT2;
+      fitText(ctx, ui.hint || namesLine(friends.map(this.nameOf)), L, 252, R - L);
     } else {
-      drawCounterLine(ctx, st.title, st.roads, cx, 212);
-      ctx.font = `700 36px ${FONT_SANS}`;
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#fff';
+      // the one figure that matters, in the accent
+      const roads = st.roads.toLocaleString('en-US');
+      ctx.font = `500 52px ${FONT_MONO}`;
+      const figW = Math.max(ctx.measureText(roads).width, 170);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = ACCENT;
+      ctx.fillText(roads, R, 196);
+      ctx.font = `400 24px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT3;
+      ctx.fillText('roads checked', R, 232);
+      ctx.textAlign = 'left';
+      ctx.font = `500 60px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT1;
+      fitText(ctx, st.title, L, 196, R - L - figW - 32);
       let sub = st.subtitle;
-      if (st.subtitle === '@meet') sub = ui.meetName ? `Meet near ${ui.meetName}` : 'Everyone can meet here';
-      fitText(ctx, sub, cx, 270, STAGE_W - 100);
+      if (sub === '@meet') sub = ui.meetName ? `Meet around ${ui.meetName}` : 'The fairest spot for everyone';
+      ctx.font = `400 32px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT2;
+      fitText(ctx, sub, L, 276, R - L);
     }
 
-    // footer
+    if (st && st.routes > 0.5 && ui.picks && ui.picks.length) this.drawPicks(ctx, ui.picks, clamp01((st.routes - 0.5) * 2));
+
     if (this.city) {
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#fff';
-      ctx.font = `800 50px ${FONT_SANS}`;
-      spacedText(ctx, this.city.name.toUpperCase(), cx, 1730, 12);
-      ctx.font = `500 23px ${FONT_SANS}`;
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText('© OpenStreetMap contributors', cx, 1778);
+      // legend for the lit streets, once they show
+      if (st && st.meetIn > 0.5 && this.result && Number.isFinite(this.result.zoneLimit)) {
+        ctx.globalAlpha = clamp01((st.meetIn - 0.5) * 2);
+        ctx.fillStyle = ACCENT;
+        ctx.beginPath();
+        ctx.roundRect(L, 1672, 28, 6, 2);
+        ctx.fill();
+        ctx.font = `400 24px ${FONT_SANS}`;
+        ctx.fillStyle = TEXT2;
+        ctx.textBaseline = 'middle';
+        fitText(ctx, `On the lit streets nobody travels more than ${(this.result.zoneLimit / 1000).toFixed(1)} km`, L + 40, 1676, R - L - 40);
+        ctx.textBaseline = 'alphabetic';
+        ctx.globalAlpha = 1;
+      }
+      ctx.font = `500 44px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT1;
+      fitText(ctx, this.city.name, L, 1756, R - L);
+      ctx.font = `400 22px ${FONT_SANS}`;
+      ctx.fillStyle = TEXT3;
+      ctx.fillText('Map data © OpenStreetMap contributors', L, 1796);
     }
     ctx.restore();
   }
 }
 
-function drawCounterLine(ctx, title, roads, cx, y) {
-  const parts = [
-    { text: title, font: `900 68px ${FONT_SANS}`, color: 'title' },
-    { text: '  ·  ', font: `700 40px ${FONT_SANS}`, color: 'rgba(255,255,255,0.55)' },
-    { text: roads.toLocaleString('en-US'), font: `700 52px ${FONT_MONO}`, color: '#ff5cae' },
-    { text: ' roads', font: `700 38px ${FONT_SANS}`, color: 'rgba(255,255,255,0.6)' },
-  ];
-  ctx.textAlign = 'left';
-  let total = 0;
-  for (const p of parts) {
-    ctx.font = p.font;
-    p.w = ctx.measureText(p.text).width;
-    total += p.w;
+/** Shortens text with an ellipsis so it fits maxW. */
+function ellipsize(ctx, text, maxW) {
+  if (ctx.measureText(text).width <= maxW) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ctx.measureText(`${text.slice(0, mid)}…`).width <= maxW) lo = mid;
+    else hi = mid - 1;
   }
-  const scale = Math.min(1, (STAGE_W - 70) / total);
-  ctx.save();
-  ctx.translate(cx, y);
-  ctx.scale(scale, scale);
-  let x = -total / 2;
-  for (const p of parts) {
-    ctx.font = p.font;
-    if (p.color === 'title') {
-      const g = ctx.createLinearGradient(x, 0, x + p.w, 0);
-      g.addColorStop(0, '#ff3d9a');
-      g.addColorStop(1, '#ff6fb5');
-      ctx.fillStyle = g;
-    } else {
-      ctx.fillStyle = p.color;
-    }
-    ctx.fillText(p.text, x, 0);
-    x += p.w;
-  }
-  ctx.restore();
+  return `${text.slice(0, lo).trimEnd()}…`;
 }
 
+function namesLine(names) {
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  if (names.length <= 4) return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  return `${names.slice(0, 2).join(', ')} and ${names.length - 2} others`;
+}
+
+/** Left-aligned text, squeezed to fit maxW when it is too long. */
 function fitText(ctx, text, x, y, maxW) {
   const w = ctx.measureText(text).width;
   if (w <= maxW) {
@@ -745,67 +776,21 @@ function fitText(ctx, text, x, y, maxW) {
   ctx.restore();
 }
 
-function spacedText(ctx, text, cx, y, spacing) {
-  const chars = [...text];
-  const widths = chars.map((c) => ctx.measureText(c).width);
-  const total = widths.reduce((a, b) => a + b, 0) + spacing * (chars.length - 1);
-  let x = cx - total / 2;
-  ctx.save();
-  ctx.textAlign = 'left';
-  chars.forEach((c, i) => {
-    ctx.fillText(c, x, y);
-    x += widths[i] + spacing;
-  });
-  ctx.restore();
-}
-
-function drawTag(ctx, text, cx, cy, { fill, text: color, stroke, padX, h }) {
-  const w = ctx.measureText(text).width + padX * 2;
-  const x = Math.max(16, Math.min(STAGE_W - 16 - w, cx - w / 2));
-  const y = cy - h / 2;
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 8);
-  ctx.fillStyle = fill;
-  ctx.fill();
-  if (stroke) {
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-  }
-  ctx.fillStyle = color;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x + w / 2, cy + 1);
-  ctx.textBaseline = 'alphabetic';
-}
-
-export function drawAvatar(ctx, x, y, r, color, alpha) {
+/** A friend's starting point: a filled circle in their line colour. */
+export function drawTerminus(ctx, x, y, r, color) {
   if (r <= 0.5) return;
-  const rgb = hexToRgb(color);
   ctx.save();
-  ctx.globalAlpha *= alpha;
-  ctx.shadowColor = rgba(rgb, 0.9);
-  ctx.shadowBlur = r * 0.8;
-  ctx.fillStyle = '#0a0a10';
+  ctx.fillStyle = INK_DEEP;
+  ctx.beginPath();
+  ctx.arc(x, y, r + 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.lineWidth = Math.max(2, r * 0.13);
-  ctx.strokeStyle = color;
-  ctx.stroke();
-  // person glyph
-  ctx.save();
+  ctx.fillStyle = INK_DEEP;
   ctx.beginPath();
-  ctx.arc(x, y, r * 0.86, 0, Math.PI * 2);
-  ctx.clip();
-  ctx.fillStyle = rgba(mix(rgb, [255, 255, 255], 0.15), 1);
-  ctx.beginPath();
-  ctx.arc(x, y - r * 0.2, r * 0.3, 0, Math.PI * 2);
+  ctx.arc(x, y, r * 0.4, 0, Math.PI * 2);
   ctx.fill();
-  ctx.beginPath();
-  ctx.ellipse(x, y + r * 0.62, r * 0.56, r * 0.45, 0, Math.PI, 0);
-  ctx.fill();
-  ctx.restore();
   ctx.restore();
 }

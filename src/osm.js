@@ -177,6 +177,64 @@ function shortName(r) {
   return r.name || a.city || a.town || a.village || a.suburb || r.display_name.split(',')[0];
 }
 
+/** Runs a small Overpass query from the page, trying each server in turn. */
+export async function overpass(query, { signal } = {}) {
+  let lastError;
+  for (const url of OVERPASS_ENDPOINTS) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `data=${encodeURIComponent(query)}`,
+        signal,
+      });
+      if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('Overpass is unreachable');
+}
+
+/**
+ * Finds a starting point by name. Results near `near` ([lon, lat] bounds)
+ * come first, but places elsewhere are still found.
+ */
+export async function geocode(q, near = null) {
+  const params = { q, limit: '5', addressdetails: '1' };
+  if (near) {
+    const [w, s, e, n] = near;
+    params.viewbox = `${w},${n},${e},${s}`;
+  }
+  const results = await nominatim('search', params);
+  return results.map((r) => ({
+    label: shortName(r),
+    detail: r.display_name,
+    lat: +r.lat,
+    lon: +r.lon,
+    city: cityOf(r.address),
+    region: r.address ? r.address.state || r.address.region || r.address.county || '' : '',
+    country: r.address ? r.address.country || '' : '',
+  }));
+}
+
+/** Short name for a point, used when a friend is moved on the map. */
+export async function placeName(lat, lon, stale = null) {
+  const r = await nominatim('reverse', { lat: lat.toFixed(5), lon: lon.toFixed(5), zoom: '16', addressdetails: '1' }, stale);
+  const a = r.address || {};
+  return {
+    label: a.neighbourhood || a.quarter || a.suburb || a.city_district || a.village || a.town || r.name || a.road || '',
+    city: cityOf(a),
+  };
+}
+
+function cityOf(a) {
+  if (!a) return '';
+  return a.city || a.town || a.village || a.municipality || a.county || '';
+}
+
 /** Overpass QL for every road of the given class inside a city. */
 export function overpassQuery(city, detail) {
   const filter = `way["highway"~"^(${ROAD_CLASSES[detail]})$"]`;

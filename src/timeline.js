@@ -20,10 +20,11 @@ export function buildTimeline(result, friends, { separate = true, speed = 1 } = 
 
   add('intro', 1.8);
   if (separate && result.separate.length) {
-    const per = Math.max(1.3, Math.min(2.1, 8 / k));
+    // about 8 to 10 seconds for the whole phase, however many friends
+    const per = Math.max(0.8, Math.min(2.1, 9 / k));
     result.separate.forEach((f, i) => {
       add('separate', per, { index: i, rMax: f.maxRadius });
-      add('pause', 0.18, { index: i });
+      add('pause', k > 6 ? 0.1 : 0.18, { index: i });
     });
     add('gap', 0.8);
   }
@@ -96,7 +97,7 @@ function frameAt(segs, time, result, friends, before) {
       st.radius = r;
       st.bandFade = seg.kind === 'pause' ? 1 - p : 1;
       st.title = 'One by one';
-      st.subtitle = `Search ${i + 1} of ${k} · ${friends[i].name}`;
+      st.subtitle = `${friends[i].name}'s search, ${i + 1} of ${k}`;
       st.roads = before[i] + f.countAt(r);
       if (seg.kind === 'separate' && i > 0) st.fadeB = 1 - clamp01(p / 0.35);
       break;
@@ -113,7 +114,7 @@ function frameAt(segs, time, result, friends, before) {
       st.radius = r;
       st.bandFade = 1;
       st.title = 'All at once';
-      st.subtitle = r >= result.firstCross ? 'Floods cross' : `All ${k} set off together`;
+      st.subtitle = r >= result.firstCross ? 'The floods cross' : `All ${k} set off together`;
       st.roads = together(r);
       break;
     }

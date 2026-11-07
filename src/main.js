@@ -1,27 +1,37 @@
 import { decodeGraph, finalizeGraph } from './graph.js';
-import { makeProjection, projectPolygons, geojsonPolygons, ringsBounds, ringsArea, simplifyFlat, landOutline, PolygonIndex } from './geo.js';
-import { solveTogether, separateFloods } from './search.js';
+import { makeProjection, projectPolygons, geojsonPolygons, ringsBounds, ringsArea, simplifyFlat, landOutline, PolygonIndex, haversine } from './geo.js';
+import { solveTogether, separateFloods, dijkstra } from './search.js';
 import { buildTimeline } from './timeline.js';
 import { Renderer, STAGE_W, STAGE_H, FONT_SANS, FONT_MONO } from './renderer.js';
-import { searchCities, lookupCity, searchPlaces, neighbourhoodName, landmarkName, overpassQuery } from './osm.js';
+import { searchCities, lookupCity, geocode, placeName, landmarkName, overpassQuery, overpass } from './osm.js';
+import { CATEGORIES, placesQuery, rankPlaces } from './places.js';
 import { CanvasRecorder, recordingSupported } from './recorder.js';
 
-const COLORS = ['#ff4fa3', '#34e3b0', '#4d7cff', '#ff7a5c', '#b56cff', '#ffd23f'];
-const NAMES = ['Alex', 'Sam', 'Maya', 'Leo', 'Nina', 'Omar'];
+// One colour per friend, like the lines on a transit map.
+const LINE_COLORS = [
+  '#e8524a', '#2bb3a3', '#3d8fe0', '#d16fb0', '#8fb83c', '#a585d6',
+  '#5fc0e8', '#d9c25a', '#b0705a', '#ee8fa8', '#9aa3b5', '#d4d97a',
+];
 const MIN_FRIENDS = 2;
-const MAX_FRIENDS = 6;
-const PRESETS = [{ id: 'tokyo', name: 'Tokyo', subtitle: '23 special wards' }];
-// Largest area (km²) we will ask Overpass for at each level of detail.
+const MAX_FRIENDS = 12;
+const PRESETS = [{ id: 'tokyo', name: 'Tokyo' }];
+// Largest area (km²) to download at each level of detail.
 const AREA_LIMIT = { all: 1500, main: 5000, major: 15000 };
+// Friends further apart than this are not one meetup.
+const MAX_SPAN_KM = 120;
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('stage');
 const renderer = new Renderer(canvas);
+renderer.nameOf = (f) => displayName(f);
+const lang = (navigator.language || 'en').slice(0, 2);
 
 const state = {
   city: null,
   graph: null,
+  outlineIndex: null,
   friends: [],
+  active: [],
   result: null,
   timeline: null,
   t: 0,
@@ -32,7 +42,12 @@ const state = {
   editing: false,
   drag: null,
   meetName: '',
+  meetLookup: 'idle',
   meetToken: 0,
+  places: null,
+  placesState: 'idle',
+  placesTab: 'eat',
+  placesToken: 0,
   recording: null,
   loading: false,
 };
@@ -50,27 +65,52 @@ function hideStatus() {
   $('status').hidden = true;
 }
 
+function setNote(id, text, error = false) {
+  $(id).textContent = text;
+  $(id).classList.toggle('error', error);
+}
+
 // ---------------------------------------------------------------------------
-// cities
+// areas: a bundled city, a city boundary from OpenStreetMap, or a box around everyone
+
+const presetMeta = new Map();
+
+async function loadPresetMeta(id) {
+  if (!presetMeta.has(id)) {
+    presetMeta.set(
+      id,
+      fetch(`data/${id}.json`).then((r) => {
+        if (!r.ok) throw new Error(`Could not load data/${id}.json (${r.status})`);
+        return r.json();
+      }),
+    );
+  }
+  return presetMeta.get(id);
+}
 
 async function loadPreset(id) {
-  const preset = PRESETS.find((p) => p.id === id);
-  setStatus(`Loading the ${preset ? preset.name : id} road network…`);
+  setStatus(`Loading the ${PRESETS.find((p) => p.id === id)?.name || id} streets`);
   const [meta, buf] = await Promise.all([
-    fetch(`data/${id}.json`).then((r) => {
-      if (!r.ok) throw new Error(`Could not load data/${id}.json (${r.status})`);
-      return r.json();
-    }),
+    loadPresetMeta(id),
     fetch(`data/${id}.tmpo`).then((r) => {
       if (!r.ok) throw new Error(`Could not load data/${id}.tmpo (${r.status})`);
       return r.arrayBuffer();
     }),
   ]);
   const graph = await decodeGraph(buf);
-  setCity(
-    { id, name: meta.name, subtitle: meta.subtitle, outline: meta.outline, defaults: meta.friends },
-    graph,
-  );
+  setCity({ id, name: meta.name, outline: meta.outline, defaults: meta.friends }, graph);
+}
+
+/** Is every friend inside a bundled city? */
+async function presetFor(friends) {
+  for (const p of PRESETS) {
+    const meta = await loadPresetMeta(p.id).catch(() => null);
+    if (!meta) continue;
+    const proj = makeProjection(meta.lon0, meta.lat0);
+    const index = new PolygonIndex(meta.outline);
+    if (friends.every((f) => index.contains(...proj.fwd(f.lon, f.lat)))) return p.id;
+  }
+  return null;
 }
 
 function autoDetail(km2) {
@@ -112,40 +152,33 @@ function buildInWorker(payload, onProgress) {
   });
 }
 
-async function loadOsmCity(place, detailChoice) {
+/** Downloads the streets of a place (a city boundary or a box) and builds the graph. */
+async function loadArea(place) {
   const polys = geojsonPolygons(place.geojson);
   const [s, n, w, e] = place.bbox;
   const lon0 = +((w + e) / 2).toFixed(5);
   const lat0 = +((s + n) / 2).toFixed(5);
   const proj = makeProjection(lon0, lat0);
   const km2 = polygonsAreaKm2(polys, proj);
-  const detail = detailChoice === 'auto' ? autoDetail(km2) : detailChoice;
-  if (!detail || km2 > AREA_LIMIT[detail]) {
-    throw new Error(
-      `${place.label} covers about ${Math.round(km2).toLocaleString()} km², which is too much to download${
-        detail && detail !== 'major' ? ' at this level of detail. Try "Major roads"' : '. Try a smaller city or a district'
-      }.`,
-    );
+  const detail = autoDetail(km2);
+  if (!detail) {
+    throw new Error(`That area is about ${Math.round(km2).toLocaleString('en-US')} km², too large to load. Tempo works within one city or region.`);
   }
 
   const label = { all: 'all streets', main: 'main roads', major: 'major roads' }[detail];
-  setStatus(`Downloading ${label} for ${place.label}…`);
-  const graph = await buildInWorker(
-    { query: overpassQuery(place, detail), polygons: polys, lon0, lat0 },
-    (msg) => {
-      if (msg.stage === 'download') setStatus(`Downloading ${label} for ${place.label}… ${(msg.bytes / 1e6).toFixed(1)} MB`);
-      else if (msg.stage === 'parse') setStatus('Reading the road data…');
-      else setStatus(`Building the road graph… ${Math.round(msg.fraction * 100)}%`);
-    },
-  );
+  setStatus(`Downloading ${label} around ${place.label}`);
+  const graph = await buildInWorker({ query: overpassQuery(place, detail), polygons: polys, lon0, lat0 }, (msg) => {
+    if (msg.stage === 'download') setStatus(`Downloading ${label} around ${place.label}, ${(msg.bytes / 1e6).toFixed(1)} MB`);
+    else if (msg.stage === 'parse') setStatus('Reading the street data');
+    else setStatus(`Building the street network, ${Math.round(msg.fraction * 100)}%`);
+  });
 
-  // Follow the shore rather than an admin line out at sea; fall back to the
-  // boundary's outer rings (holes read better as plain dark gaps).
+  // follow the shore rather than a boundary out at sea
   let outline = [];
   try {
     outline = landOutline(graph, new PolygonIndex(projectPolygons(polys, proj)));
   } catch (err) {
-    console.warn('Could not trace the city outline:', err);
+    console.warn('Could not trace the outline:', err);
   }
   if (!outline.length) {
     const rings = projectPolygons(polys.map((p) => [p[0]]), proj);
@@ -153,22 +186,105 @@ async function loadOsmCity(place, detailChoice) {
     const tol = Math.hypot(b.maxX - b.minX, b.maxY - b.minY) * 0.0007;
     outline = rings.map((r) => simplifyFlat(r, tol)).filter((r) => r.length >= 8);
   }
-  setCity(
-    {
-      id: `osm:${place.osmType}:${place.osmId}`,
-      name: place.label,
-      subtitle: `${graph.nEdges.toLocaleString()} roads · ${label}`,
-      outline,
-      osm: place,
-      detail,
-    },
-    graph,
-  );
+  setCity({ id: place.id, name: place.label, outline, detail }, graph);
+}
+
+function cityPlace(c) {
+  return { ...c, id: `osm:${c.osmType}:${c.osmId}` };
+}
+
+/** A box around every friend, with some room around the edges. */
+function boxPlace(friends, name) {
+  const lats = friends.map((f) => f.lat);
+  const lons = friends.map((f) => f.lon);
+  let s = Math.min(...lats), n = Math.max(...lats), w = Math.min(...lons), e = Math.max(...lons);
+  const span = haversine(w, s, e, n) / 1000;
+  if (span > MAX_SPAN_KM) {
+    throw new Error(`These starting points are about ${Math.round(span)} km apart. Tempo works within one city or region, up to about ${MAX_SPAN_KM} km across.`);
+  }
+  const midLat = (s + n) / 2;
+  const padLat = Math.max((n - s) * 0.2, 1500 / 111320);
+  const padLon = Math.max((e - w) * 0.2, 1500 / (111320 * Math.cos((midLat * Math.PI) / 180)));
+  s -= padLat; n += padLat; w -= padLon; e += padLon;
+  const r = (v) => +v.toFixed(4);
+  [s, n, w, e] = [r(s), r(n), r(w), r(e)];
+  return {
+    id: `box:${s},${w},${n},${e}`,
+    osmType: 'box',
+    label: name,
+    bbox: [s, n, w, e],
+    geojson: { type: 'Polygon', coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]] },
+  };
+}
+
+function boxFromId(id, name) {
+  const [s, w, n, e] = id.slice(4).split(',').map(Number);
+  return {
+    id,
+    osmType: 'box',
+    label: name,
+    bbox: [s, n, w, e],
+    geojson: { type: 'Polygon', coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]] },
+  };
+}
+
+function mostCommon(values) {
+  const counts = new Map();
+  for (const v of values) if (v) counts.set(v, (counts.get(v) || 0) + 1);
+  let best = '';
+  let n = 0;
+  for (const [v, c] of counts) if (c > n) [best, n] = [v, c];
+  return best;
+}
+
+/** Picks and loads an area that holds every friend, unless the current one does. */
+async function ensureArea(friends) {
+  if (state.graph && friends.every(insideArea)) return;
+  const preset = await presetFor(friends);
+  if (preset) {
+    if (state.city?.id !== preset) await loadPreset(preset);
+    return;
+  }
+  // everyone in the same city: use its boundary when it is small enough for every street
+  const city = mostCommon(friends.map((f) => f.city));
+  if (city && friends.every((f) => f.city === city)) {
+    setStatus(`Looking up ${city}`);
+    const country = mostCommon(friends.map((f) => f.country));
+    const found = await searchCities([city, country].filter(Boolean).join(', ')).catch(() => []);
+    for (const c of found) {
+      const [s, n, w, e] = c.bbox;
+      const proj = makeProjection((w + e) / 2, (s + n) / 2);
+      const polys = geojsonPolygons(c.geojson);
+      const km2 = polygonsAreaKm2(polys, proj);
+      const index = new PolygonIndex(projectPolygons(polys, proj));
+      if (km2 <= 600 && friends.every((f) => index.contains(...proj.fwd(f.lon, f.lat)))) {
+        await loadArea(cityPlace(c));
+        return;
+      }
+    }
+  }
+  let name = city || mostCommon(friends.map((f) => f.region));
+  if (!name) {
+    // links shared before carry no city; name the area from its middle
+    const lat = friends.reduce((a, f) => a + f.lat, 0) / friends.length;
+    const lon = friends.reduce((a, f) => a + f.lon, 0) / friends.length;
+    name = (await placeName(lat, lon).catch(() => null))?.city || 'Your meetup';
+  }
+  await loadArea(boxPlace(friends, name));
+}
+
+function insideArea(f) {
+  if (!state.graph || f.lat == null) return false;
+  const [x, y] = state.graph.proj.fwd(f.lon, f.lat);
+  if (state.outlineIndex && state.outlineIndex.contains(x, y)) return true;
+  // parks, airports and stations can sit a few hundred metres from a through
+  // street; the trip then starts at the nearest one
+  const n = state.graph.grid.nearest(x, y);
+  return Math.hypot(state.graph.nodeX[n] - x, state.graph.nodeY[n] - y) < 1000;
 }
 
 function setCity(city, graph) {
   city.outlineBounds = ringsBounds(city.outline);
-  // the outline may be missing or tiny for odd places; fall back to the roads
   if (!(city.outlineBounds.maxX > city.outlineBounds.minX)) city.outlineBounds = graph.bounds;
   const b = city.outlineBounds;
   const [w, s] = graph.proj.inv(b.minX, b.minY);
@@ -176,107 +292,184 @@ function setCity(city, graph) {
   city.bbox = [w, s, e, n];
   state.city = city;
   state.graph = graph;
+  state.outlineIndex = city.outline.length ? new PolygonIndex(city.outline) : null;
   renderer.setCity(city, graph);
-  renderCityOptions();
 }
 
 // ---------------------------------------------------------------------------
 // friends
 
-function snapFriend(f) {
-  const g = state.graph;
-  const [x, y] = g.proj.fwd(f.lon, f.lat);
-  f.node = g.grid.nearest(x, y);
-  [f.lon, f.lat] = g.proj.inv(g.nodeX[f.node], g.nodeY[f.node]);
+function newFriend(fields = {}) {
+  return {
+    name: '',
+    query: '',
+    place: '',
+    detail: '',
+    lat: null,
+    lon: null,
+    node: null,
+    city: '',
+    region: '',
+    country: '',
+    alts: [],
+    status: 'empty',
+    token: 0,
+    color: nextColor(),
+    ...fields,
+  };
 }
 
 function nextColor() {
-  return COLORS.find((c) => !state.friends.some((f) => f.color === c)) || COLORS[state.friends.length % COLORS.length];
+  return LINE_COLORS.find((c) => !state.friends.some((f) => f.color === c)) || LINE_COLORS[state.friends.length % LINE_COLORS.length];
 }
 
-function nextName() {
-  return NAMES.find((n) => !state.friends.some((f) => f.name === n)) || `Friend ${state.friends.length + 1}`;
+function displayName(f) {
+  return f.name.trim() || `Friend ${state.friends.indexOf(f) + 1}`;
 }
 
-/** Spread friends around the city when it has no defaults of its own. */
-function spreadFriends(count, names) {
-  const b = state.city.outlineBounds;
-  const cx = (b.minX + b.maxX) / 2;
-  const cy = (b.minY + b.maxY) / 2;
-  const rx = ((b.maxX - b.minX) / 2) * 0.6;
-  const ry = ((b.maxY - b.minY) / 2) * 0.6;
+/** Short label for the map: what they typed when it is short, else the geocoder's name. */
+function shortPlace(query, label) {
+  const q = query.trim();
+  return q && q.length <= 28 ? q : label;
+}
+
+function located(f) {
+  return f.lat != null && f.lon != null && f.status === 'found';
+}
+
+function snap(f) {
   const g = state.graph;
-  const out = [];
-  for (let i = 0; i < count; i++) {
-    const a = Math.PI / 2 + (i * 2 * Math.PI) / count + Math.PI / 4;
-    const node = g.grid.nearest(cx + rx * Math.cos(a), cy + ry * Math.sin(a));
-    const [lon, lat] = g.proj.inv(g.nodeX[node], g.nodeY[node]);
-    out.push({ name: names[i] || NAMES[i], place: '', lon, lat, node, color: COLORS[i] });
-  }
-  return out;
+  const [x, y] = g.proj.fwd(f.lon, f.lat);
+  f.node = g.grid.nearest(x, y);
 }
 
-function setFriends(list) {
-  state.friends.length = 0;
-  for (const f of list) state.friends.push(f);
-  state.friends.forEach((f, i) => {
-    f.color ||= COLORS[i % COLORS.length];
-    snapFriend(f);
+/** Bounds to favour when geocoding: the current map, else where the others are. */
+function searchBias() {
+  if (state.city) return state.city.bbox || null;
+  const done = state.friends.filter(located);
+  if (!done.length) return null;
+  const lats = done.map((f) => f.lat);
+  const lons = done.map((f) => f.lon);
+  return [Math.min(...lons) - 0.2, Math.min(...lats) - 0.2, Math.max(...lons) + 0.2, Math.max(...lats) + 0.2];
+}
+
+async function lookupFriend(f, { quiet = false } = {}) {
+  const q = f.query.trim();
+  const token = ++f.token;
+  if (!q) {
+    Object.assign(f, { status: 'empty', lat: null, lon: null, node: null, place: '', detail: '', alts: [] });
+    renderFriends();
+    return;
+  }
+  f.status = 'pending';
+  renderFriends();
+  try {
+    const results = await geocode(q, searchBias());
+    if (token !== f.token) return;
+    if (!results.length) {
+      Object.assign(f, { status: 'missing', alts: [] });
+    } else {
+      useResult(f, results[0]);
+      f.alts = results.slice(1);
+    }
+  } catch (err) {
+    if (token !== f.token) return;
+    console.warn('Geocoding failed:', err);
+    f.status = 'error';
+  }
+  renderFriends();
+  if (!quiet) afterMove(f);
+}
+
+function useResult(f, r) {
+  Object.assign(f, {
+    status: 'found',
+    lat: r.lat,
+    lon: r.lon,
+    place: shortPlace(f.query, r.label),
+    detail: r.detail,
+    city: r.city,
+    region: r.region,
+    country: r.country,
+    node: null,
   });
-  state.selected = -1;
 }
 
-function fillPlaceNames(friends) {
-  for (const f of friends) {
-    if (f.place) continue;
-    const token = (f.placeToken = (f.placeToken || 0) + 1);
-    const stale = () => f.placeToken !== token || !state.friends.includes(f);
-    neighbourhoodName(f.lat, f.lon, stale)
-      .then((name) => {
-        if (stale() || !name) return;
-        f.place = name;
-        renderFriends();
-        draw();
-        writeHash();
-      })
-      .catch(() => {});
+/** A friend has new coordinates: update straight away when they are on this map. */
+function afterMove(f) {
+  if (!located(f)) return;
+  if (insideArea(f)) {
+    commitEdit();
+  } else {
+    setNote('find-note', `${f.place || displayName(f)} is outside this map. Find where to meet loads the area around everyone.`);
   }
+}
+
+function fillPlaceName(f) {
+  const token = ++f.token;
+  const stale = () => f.token !== token || !state.friends.includes(f);
+  placeName(f.lat, f.lon, stale)
+    .then((r) => {
+      if (stale() || !r.label) return;
+      f.place = r.label;
+      f.query = r.label;
+      f.detail = '';
+      if (r.city) f.city = r.city;
+      renderFriends();
+      draw();
+      writeHash();
+    })
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
 // solving
 
 let separateTimer = 0;
+let placesTimer = 0;
 
 function compute() {
   const g = state.graph;
-  const sources = state.friends.map((f) => f.node);
-  state.result = solveTogether(g, sources);
-  renderer.setResult(state.result, state.friends);
+  state.active = state.friends.filter((f) => located(f) && insideArea(f));
+  for (const f of state.active) snap(f);
+  clearTimeout(separateTimer);
+  clearTimeout(placesTimer);
+  if (state.active.length < MIN_FRIENDS) {
+    state.result = null;
+    state.timeline = null;
+    renderer.result = null;
+    renderer.friends = state.active;
+    renderResult();
+    renderPlaces();
+    return;
+  }
+  state.result = solveTogether(g, state.active.map((f) => f.node));
+  renderer.setResult(state.result, state.active);
   rebuildTimeline();
   renderResult();
   requestMeetName();
   writeHash();
   // the one-by-one floods are only needed for playback; compute them when idle
-  clearTimeout(separateTimer);
-  separateTimer = setTimeout(ensureSeparate, 120);
+  separateTimer = setTimeout(ensureSeparate, 150);
+  placesTimer = setTimeout(loadPlaces, 500);
 }
 
 function ensureSeparate() {
   const res = state.result;
   if (!res || !state.showSeparate || res.separate.length) return;
   const atEnd = state.timeline && state.t >= state.timeline.duration - 1e-3;
-  res.separate = separateFloods(state.graph, state.friends.map((f) => f.node));
-  renderer.setResult(res, state.friends);
+  res.separate = separateFloods(state.graph, state.active.map((f) => f.node));
+  renderer.setResult(res, state.active);
   rebuildTimeline();
   if (atEnd) state.t = state.timeline.duration;
   draw();
 }
 
 function rebuildTimeline() {
+  if (!state.result) return;
   const old = state.timeline;
   const frac = old ? state.t / old.duration : 0;
-  state.timeline = buildTimeline(state.result, state.friends, {
+  state.timeline = buildTimeline(state.result, state.active.map((f) => ({ name: displayName(f) })), {
     separate: state.showSeparate,
     speed: state.speed,
   });
@@ -284,13 +477,18 @@ function rebuildTimeline() {
   $('scrub').max = state.timeline.duration;
 }
 
+function meetLonLat() {
+  const g = state.graph;
+  const m = state.result.meet;
+  return g.proj.inv(g.nodeX[m], g.nodeY[m]);
+}
+
 function requestMeetName() {
   const res = state.result;
   const token = ++state.meetToken;
   state.meetName = '';
   if (!res || res.meet < 0) return;
-  const g = state.graph;
-  const [lon, lat] = g.proj.inv(g.nodeX[res.meet], g.nodeY[res.meet]);
+  const [lon, lat] = meetLonLat();
   state.meetLookup = 'loading';
   renderResult();
   landmarkName(lat, lon, () => token !== state.meetToken)
@@ -303,21 +501,129 @@ function requestMeetName() {
     })
     .catch((err) => {
       if (token !== state.meetToken) return;
-      console.warn('Could not name the meeting point:', err);
+      if (err.message !== 'stale') console.warn('Could not name the meeting point:', err);
       state.meetLookup = 'failed';
       renderResult();
     });
 }
 
 // ---------------------------------------------------------------------------
+// things to do
+
+async function loadPlaces() {
+  const res = state.result;
+  if (!res || res.meet < 0) return;
+  const token = ++state.placesToken;
+  const [lon, lat] = meetLonLat();
+  state.placesState = 'loading';
+  state.places = null;
+  renderPlaces();
+  try {
+    const data = await overpass(placesQuery(lat, lon, 1200));
+    if (token !== state.placesToken) return;
+    const walk = dijkstra(state.graph, res.meet).dist;
+    state.places = rankPlaces(data.elements || [], { graph: state.graph, walk, lang });
+    state.placesState = 'done';
+  } catch (err) {
+    if (token !== state.placesToken) return;
+    console.warn('Could not load places:', err);
+    state.placesState = 'error';
+  }
+  renderPlaces();
+  draw();
+}
+
+function renderPlaces() {
+  const box = $('todo');
+  if (!state.result || state.result.meet < 0) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const [lon, lat] = meetLonLat();
+  $('todo-map').href = `https://www.openstreetmap.org/?mlat=${lat.toFixed(5)}&mlon=${lon.toFixed(5)}#map=16/${lat.toFixed(5)}/${lon.toFixed(5)}`;
+
+  const tabs = $('tabs');
+  tabs.innerHTML = '';
+  for (const c of CATEGORIES) {
+    const b = document.createElement('button');
+    b.className = 'tab';
+    b.setAttribute('role', 'tab');
+    b.dataset.tab = c.id;
+    b.setAttribute('aria-selected', String(state.placesTab === c.id));
+    b.textContent = c.label;
+    if (state.places) {
+      const n = document.createElement('span');
+      n.className = 'count';
+      n.textContent = state.places[c.id].length;
+      b.appendChild(n);
+    }
+    tabs.appendChild(b);
+  }
+
+  const list = $('places');
+  list.innerHTML = '';
+  if (state.placesState === 'loading') {
+    setNote('places-note', 'Looking for places within a short walk');
+    return;
+  }
+  if (state.placesState === 'error') {
+    $('places-note').innerHTML = 'Could not reach the OpenStreetMap place search. <button class="link" id="places-retry">Try again</button>';
+    $('places-note').classList.add('error');
+    return;
+  }
+  const items = state.places ? state.places[state.placesTab] : [];
+  if (!items.length) {
+    setNote('places-note', 'Nothing of this kind is mapped within a short walk. The lit streets nearby may have more.');
+    return;
+  }
+  setNote('places-note', 'Walking times from the meeting point, along the streets');
+  for (const p of items) {
+    const li = document.createElement('li');
+    li.innerHTML = `<a href="${p.url}" target="_blank" rel="noopener"><span class="name"></span><span class="kind"></span><span class="walk">${p.minutes} min</span></a>`;
+    li.querySelector('.name').textContent = p.name;
+    li.querySelector('.kind').textContent = p.kind;
+    list.appendChild(li);
+  }
+}
+
+$('tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('.tab');
+  if (!b) return;
+  state.placesTab = b.dataset.tab;
+  renderPlaces();
+});
+
+$('tabs').addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+  const ids = CATEGORIES.map((c) => c.id);
+  const i = ids.indexOf(state.placesTab);
+  state.placesTab = ids[(i + (e.key === 'ArrowRight' ? 1 : ids.length - 1)) % ids.length];
+  renderPlaces();
+  $('tabs').querySelector(`[data-tab="${state.placesTab}"]`)?.focus();
+});
+
+$('places-note').addEventListener('click', (e) => {
+  if (e.target.id === 'places-retry') loadPlaces();
+});
+
+// ---------------------------------------------------------------------------
 // playback
 
 let lastFrame = 0;
 
+function picks() {
+  if (!state.places) return [];
+  return CATEGORIES.map((c) => ({ label: c.label, top: state.places[c.id][0] }))
+    .filter((p) => p.top)
+    .map((p) => ({ label: p.label, name: p.top.name, minutes: p.top.minutes }));
+}
+
 function draw() {
-  const ui = { selected: state.selected, meetName: state.meetName };
+  const selectedFriend = state.friends[state.selected];
+  const ui = { selected: state.active.indexOf(selectedFriend), meetName: state.meetName, picks: picks() };
   if (state.editing || !state.timeline) {
-    if (state.selected >= 0 && !state.drag) ui.hint = `Click the map to move ${state.friends[state.selected].name}`;
+    if (selectedFriend && !state.drag) ui.hint = `Click the map to move ${displayName(selectedFriend)}`;
     renderer.draw(null, 0, ui);
   } else {
     renderer.draw(state.timeline, state.t, ui);
@@ -366,34 +672,23 @@ function seek(t) {
 function updateTransport() {
   $('play').classList.toggle('playing', state.playing);
   $('play').setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
+  $('play').disabled = !state.timeline;
   if (state.timeline) {
     $('scrub').value = state.t;
-    $('time').textContent = `${state.t.toFixed(1)}s`;
+    $('time').textContent = `${state.t.toFixed(1)} s`;
   }
 }
 
 // ---------------------------------------------------------------------------
 // panel
 
-function renderCityOptions() {
-  const sel = $('city');
-  sel.innerHTML = '';
-  for (const p of PRESETS) sel.add(new Option(`${p.name} · ${p.subtitle}`, p.id));
-  if (state.city && !PRESETS.some((p) => p.id === state.city.id)) {
-    sel.add(new Option(`${state.city.name} · ${state.city.subtitle}`, state.city.id));
-  }
-  if (state.city) sel.value = state.city.id;
-}
-
 const ICONS = {
-  search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
   remove: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
 };
 
 /**
- * Updates the friends list in place, so open place searches and the field
- * being typed in survive background updates. Rows are only rebuilt when
- * friends are added or removed.
+ * Updates the friends list in place, so the field being typed in keeps its
+ * focus. Rows are rebuilt only when friends are added or removed.
  */
 function renderFriends() {
   const list = $('friends');
@@ -403,113 +698,194 @@ function renderFriends() {
       const li = document.createElement('li');
       li.className = 'friend';
       li.innerHTML = `
-        <button class="swatch"></button>
-        <div class="fields">
-          <input class="name" type="text" aria-label="Name" maxlength="18">
-          <input class="place" type="text" aria-label="Place label" placeholder="Place" maxlength="32">
-        </div>
-        <button class="icon locate">${ICONS.search}</button>
-        <button class="icon remove">${ICONS.remove}</button>`;
+        <button class="line-chip"></button>
+        <input class="name" type="text" placeholder="Name" maxlength="18" autocomplete="off">
+        <input class="where" type="text" placeholder="Starting point" maxlength="80" autocomplete="off" enterkeyhint="search">
+        <button class="icon remove">${ICONS.remove}</button>
+        <p class="status"></p>
+        <ul class="alts" hidden></ul>`;
       list.appendChild(li);
     });
   }
   state.friends.forEach((f, i) => {
     const li = list.children[i];
     li.dataset.i = i;
-    li.classList.toggle('selected', state.selected === i);
     li.style.setProperty('--c', f.color);
-    const swatch = li.querySelector('.swatch');
-    swatch.title = `Select ${f.name} to move them on the map`;
-    swatch.setAttribute('aria-pressed', String(state.selected === i));
-    for (const [cls, value] of [['name', f.name], ['place', f.place || '']]) {
-      const input = li.querySelector(`input.${cls}`);
-      if (document.activeElement !== input && input.value !== value) input.value = value;
-    }
-    li.querySelector('.locate').title = `Find a place for ${f.name}`;
+    li.classList.toggle('selected', state.selected === i);
+    li.classList.toggle('missing', f.status === 'missing' || f.status === 'error');
+    const name = displayName(f);
+    const chip = li.querySelector('.line-chip');
+    chip.setAttribute('aria-label', `Move ${name} on the map`);
+    chip.setAttribute('aria-pressed', String(state.selected === i));
+    chip.disabled = !located(f) || !insideArea(f);
+    const nameInput = li.querySelector('.name');
+    nameInput.setAttribute('aria-label', `Friend ${i + 1} name`);
+    nameInput.placeholder = `Friend ${i + 1}`;
+    if (document.activeElement !== nameInput && nameInput.value !== f.name) nameInput.value = f.name;
+    const where = li.querySelector('.where');
+    where.setAttribute('aria-label', `${name}'s starting point`);
+    if (document.activeElement !== where && where.value !== f.query) where.value = f.query;
     const remove = li.querySelector('.remove');
-    remove.title = `Remove ${f.name}`;
+    remove.setAttribute('aria-label', `Remove ${name}`);
     remove.disabled = state.friends.length <= MIN_FRIENDS;
+
+    // always one line tall, so buttons below never move while a lookup runs
+    const status = li.querySelector('.status');
+    status.innerHTML = '';
+    const text = document.createElement('span');
+    if (f.status === 'pending') text.textContent = 'Looking up';
+    else if (f.status === 'missing') text.textContent = 'No match. Try adding the city.';
+    else if (f.status === 'error') text.textContent = 'The place search is not answering. Try again in a moment.';
+    else if (f.status === 'found') text.textContent = f.detail && f.detail !== f.query ? f.detail : '';
+    else text.textContent = 'Neighbourhood, station or address';
+    status.appendChild(text);
+    if (f.status === 'found' && f.alts.length) {
+      const alt = document.createElement('button');
+      alt.className = 'link alt-toggle';
+      alt.textContent = 'Not this one';
+      status.appendChild(alt);
+    }
   });
-  $('add-friend').disabled = state.friends.length >= MAX_FRIENDS || !state.graph;
+  $('add-friend').disabled = state.friends.length >= MAX_FRIENDS;
+  $('friend-count').textContent = `${state.friends.length} of ${MAX_FRIENDS}`;
+}
+
+function toggleAlts(li, f) {
+  const ul = li.querySelector('.alts');
+  if (!ul.hidden) {
+    ul.hidden = true;
+    return;
+  }
+  ul.innerHTML = '';
+  for (const r of f.alts) {
+    const item = document.createElement('li');
+    const b = document.createElement('button');
+    b.textContent = r.detail;
+    b.addEventListener('click', () => {
+      const previous = { label: f.place, detail: f.detail, lat: f.lat, lon: f.lon, city: f.city, region: f.region, country: f.country };
+      useResult(f, r);
+      f.alts = [previous, ...f.alts.filter((a) => a !== r)];
+      ul.hidden = true;
+      renderFriends();
+      afterMove(f);
+    });
+    item.appendChild(b);
+    ul.appendChild(item);
+  }
+  ul.hidden = false;
 }
 
 function renderResult() {
   const res = state.result;
-  const card = $('result-card');
+  const card = $('result');
   if (!res || res.meet < 0) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  const g = state.graph;
-  const [lon, lat] = g.proj.inv(g.nodeX[res.meet], g.nodeY[res.meet]);
-  const name = $('meet-name');
-  name.classList.toggle('loading', !state.meetName);
-  name.textContent = state.meetName || (state.meetLookup === 'loading' ? 'Finding a name…' : 'Unnamed spot');
-  const osm = `https://www.openstreetmap.org/?mlat=${lat.toFixed(5)}&mlon=${lon.toFixed(5)}#map=17/${lat.toFixed(5)}/${lon.toFixed(5)}`;
+  $('meet-name').textContent = state.meetName
+    ? `Around ${state.meetName}`
+    : state.meetLookup === 'loading'
+      ? 'Finding a name for the spot'
+      : 'The fairest spot for everyone';
   const longest = Math.max(...res.paths.map((p) => p.length));
-  $('meet-where').innerHTML = `${lat.toFixed(4)}, ${lon.toFixed(4)} · <a href="${osm}" target="_blank" rel="noopener">open map</a> · longest trip ${(longest / 1000).toFixed(1)} km`;
+  $('meet-zone').textContent = `On the lit streets nobody travels more than ${(res.zoneLimit / 1000).toFixed(1)} km. At the centre the longest trip is ${(longest / 1000).toFixed(1)} km.`;
 
-  $('trips').innerHTML = state.friends
-    .map(
-      (f, i) =>
-        `<li style="--c:${f.color}"><span class="dot"></span><span class="who">${escapeHtml(f.name)}</span><b>${(res.paths[i].length / 1000).toFixed(1)} km</b></li>`,
-    )
-    .join('');
+  const trips = $('trips');
+  trips.innerHTML = '';
+  state.active.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.style.setProperty('--c', f.color);
+    if ((res.paths[i].length / 1000).toFixed(1) === (longest / 1000).toFixed(1)) li.classList.add('longest');
+    li.innerHTML = '<span class="chip"></span><span class="who"><strong></strong> <span></span></span><b></b>';
+    li.querySelector('strong').textContent = displayName(f);
+    li.querySelector('.who span').textContent = f.place ? `from ${f.place}` : '';
+    li.querySelector('b').textContent = `${(res.paths[i].length / 1000).toFixed(1)} km`;
+    trips.appendChild(li);
+  });
+
   $('roads-sep').textContent = res.roadsSeparate.toLocaleString('en-US');
   $('roads-tog').textContent = res.roadsTogether.toLocaleString('en-US');
   $('bar-sep').style.width = '100%';
   $('bar-tog').style.width = `${(100 * res.roadsTogether) / res.roadsSeparate}%`;
   const saved = 1 - res.roadsTogether / res.roadsSeparate;
-  $('saving').textContent = `Searching together checked ${Math.round(saved * 100)}% fewer roads and stopped as soon as all ${state.friends.length} floods met.`;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  $('saving').textContent = `${Math.round(saved * 100)}% fewer, because the search stops as soon as all ${state.active.length} floods reach the same junction`;
 }
 
 function selectFriend(i) {
   state.selected = state.selected === i ? -1 : i;
-  if (state.selected >= 0) {
-    pause();
-    state.editing = true;
-  } else {
-    state.editing = false;
-  }
+  state.editing = state.selected >= 0;
+  if (state.editing) pause();
   $('stage-box').classList.toggle('placing', state.selected >= 0);
   renderFriends();
   draw();
 }
 
-function commitEdit(moved = []) {
-  for (const f of moved) f.place = '';
+/** Recompute after a change and show the final frame. */
+function commitEdit() {
+  setNote('find-note', '');
   compute();
-  state.t = state.timeline.duration;
+  if (state.timeline) state.t = state.timeline.duration;
   state.editing = false;
   renderFriends();
   draw();
-  fillPlaceNames(moved);
 }
 
 function addFriend() {
-  if (state.friends.length >= MAX_FRIENDS || !state.graph) return;
-  const b = state.city.outlineBounds;
-  const g = state.graph;
-  // a little off-centre so it does not land on the meeting point
-  const node = g.grid.nearest((b.minX + b.maxX) / 2 + (b.maxX - b.minX) * 0.15, (b.minY + b.maxY) / 2 - (b.maxY - b.minY) * 0.2);
-  const [lon, lat] = g.proj.inv(g.nodeX[node], g.nodeY[node]);
-  const f = { name: nextName(), place: '', lon, lat, node, color: nextColor() };
-  state.friends.push(f);
-  commitEdit([f]);
-  selectFriend(state.friends.length - 1);
+  if (state.friends.length >= MAX_FRIENDS) return;
+  state.friends.push(newFriend());
+  renderFriends();
+  $('friends').lastElementChild.querySelector('.name').focus();
 }
 
 function removeFriend(i) {
   if (state.friends.length <= MIN_FRIENDS) return;
-  state.friends.splice(i, 1);
+  const [f] = state.friends.splice(i, 1);
   state.selected = -1;
   $('stage-box').classList.remove('placing');
-  commitEdit();
+  renderFriends();
+  if (state.active.includes(f)) commitEdit();
+  else writeHash();
+}
+
+/** The main action: look up anything new, load the area, solve and play. */
+async function findMeeting() {
+  if (state.loading) return;
+  pause();
+  setNote('find-note', '');
+  const pending = state.friends.filter((f) => f.query.trim() && f.status !== 'found');
+  for (const f of pending) await lookupFriend(f, { quiet: true });
+  const ready = state.friends.filter(located);
+  if (ready.length < MIN_FRIENDS) {
+    setNote('find-note', 'Add at least two starting points that can be found on the map', true);
+    return;
+  }
+  const missing = state.friends.filter((f) => f.query.trim() && !located(f));
+  state.loading = true;
+  $('find').disabled = true;
+  try {
+    await ensureArea(ready);
+    state.selected = -1;
+    state.t = 0;
+    state.timeline = null;
+    compute();
+    hideStatus();
+    state.loading = false;
+    renderFriends();
+    writeHash();
+    if (missing.length) setNote('find-note', `Left out ${missing.map(displayName).join(', ')}, whose starting point was not found`);
+    // on phones the stage sits below the form
+    if (matchMedia('(max-width: 880px)').matches) $('stage-box').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    play();
+  } catch (err) {
+    console.error(err);
+    state.loading = false;
+    hideStatus();
+    setNote('find-note', err.message, true);
+    draw();
+  } finally {
+    $('find').disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,12 +899,12 @@ function stagePoint(e) {
 function hitFriend(sx, sy) {
   if (!renderer.geo) return -1;
   let best = -1;
-  let bestD = 48;
-  state.friends.forEach((f, i) => {
+  let bestD = 44;
+  state.active.forEach((f) => {
     const d = Math.hypot(renderer.geo.nx[f.node] - sx, renderer.geo.ny[f.node] - sy);
     if (d < bestD) {
       bestD = d;
-      best = i;
+      best = state.friends.indexOf(f);
     }
   });
   return best;
@@ -540,6 +916,8 @@ function moveFriend(i, sx, sy) {
   const f = state.friends[i];
   f.node = g.grid.nearest(x, y);
   [f.lon, f.lat] = g.proj.inv(g.nodeX[f.node], g.nodeY[f.node]);
+  f.status = 'found';
+  f.alts = [];
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -559,7 +937,9 @@ canvas.addEventListener('pointerdown', (e) => {
   }
   if (state.selected >= 0) {
     moveFriend(state.selected, sx, sy);
-    commitEdit([state.friends[state.selected]]);
+    const f = state.friends[state.selected];
+    commitEdit();
+    fillPlaceName(f);
   }
 });
 
@@ -582,9 +962,11 @@ function endDrag(e) {
   if (moved) {
     state.selected = -1;
     $('stage-box').classList.remove('placing');
-    commitEdit([state.friends[i]]);
+    const f = state.friends[i];
+    commitEdit();
+    fillPlaceName(f);
   } else {
-    // a click on a marker selects it
+    // a click on a marker selects it, so the next click on the map moves it
     $('stage-box').classList.toggle('placing', state.selected >= 0);
     renderFriends();
     draw();
@@ -601,154 +983,41 @@ $('friends').addEventListener('click', (e) => {
   const li = e.target.closest('.friend');
   if (!li) return;
   const i = +li.dataset.i;
+  const f = state.friends[i];
   if (e.target.closest('.remove')) return removeFriend(i);
-  if (e.target.closest('.locate')) return togglePlaceSearch(li, i);
-  if (e.target.closest('input') || e.target.closest('.place-search')) return;
-  selectFriend(i);
+  if (e.target.closest('.line-chip')) return selectFriend(i);
+  if (e.target.closest('.alt-toggle')) return toggleAlts(li, f);
 });
 
 $('friends').addEventListener('input', (e) => {
   const li = e.target.closest('.friend');
   if (!li) return;
   const f = state.friends[+li.dataset.i];
-  if (e.target.classList.contains('name')) f.name = e.target.value || '?';
-  else if (e.target.classList.contains('place')) {
-    f.place = e.target.value;
-    f.placeToken = (f.placeToken || 0) + 1; // typed by hand; ignore pending lookups
-  } else return;
-  draw();
-  writeHash();
-});
-
-$('friends').addEventListener('change', (e) => {
-  if (e.target.classList.contains('name')) renderResult();
-});
-
-function togglePlaceSearch(li, i) {
-  const open = li.querySelector('.place-search');
-  if (open) {
-    open.remove();
-    return;
+  if (e.target.classList.contains('name')) {
+    f.name = e.target.value;
+    rebuildTimeline();
+    draw();
+    renderResult();
+    writeHash();
+  } else if (e.target.classList.contains('where')) {
+    f.query = e.target.value;
   }
-  const box = document.createElement('form');
-  box.className = 'place-search';
-  box.innerHTML = `<input type="search" placeholder="Search a place in ${escapeHtml(state.city.name)}…" aria-label="Search a place"><ul class="results" hidden></ul>`;
-  li.appendChild(box);
-  const input = box.querySelector('input');
-  const results = box.querySelector('.results');
-  input.focus();
-  box.addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    const q = input.value.trim();
-    if (!q) return;
-    results.hidden = false;
-    results.innerHTML = '<li class="empty">Searching…</li>';
-    try {
-      const found = await searchPlaces(q, state.city.bbox);
-      if (!found.length) {
-        results.innerHTML = '<li class="empty">Nothing found in this city.</li>';
-        return;
-      }
-      results.innerHTML = '';
-      for (const p of found) {
-        const item = document.createElement('li');
-        item.innerHTML = `<button type="button">${escapeHtml(p.label)}<small>${escapeHtml(p.detail)}</small></button>`;
-        item.querySelector('button').addEventListener('click', () => {
-          const f = state.friends[i];
-          f.lat = p.lat;
-          f.lon = p.lon;
-          f.placeToken = (f.placeToken || 0) + 1; // drop any pending automatic label
-          snapFriend(f);
-          box.remove();
-          commitEdit();
-          f.place = p.label;
-          renderFriends();
-          draw();
-          writeHash();
-        });
-        results.appendChild(item);
-      }
-    } catch (err) {
-      results.innerHTML = `<li class="empty">Search failed: ${escapeHtml(err.message)}</li>`;
-    }
-  });
-}
+});
+
+// a changed starting point is looked up when the field is left or Enter is pressed
+$('friends').addEventListener('change', (e) => {
+  if (!e.target.classList.contains('where')) return;
+  const f = state.friends[+e.target.closest('.friend').dataset.i];
+  lookupFriend(f);
+});
+
+$('friends').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.classList.contains('where')) e.target.blur();
+});
 
 $('add-friend').addEventListener('click', addFriend);
-
-$('city').addEventListener('change', async (e) => {
-  const id = e.target.value;
-  if (PRESETS.some((p) => p.id === id)) await switchCity(() => loadPreset(id));
-});
-
-$('city-search').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const q = $('city-q').value.trim();
-  if (!q) return;
-  const list = $('city-results');
-  list.hidden = false;
-  list.innerHTML = '<li class="empty">Searching…</li>';
-  try {
-    const found = await searchCities(q);
-    if (!found.length) {
-      list.innerHTML = '<li class="empty">No city with a boundary found. Try another spelling.</li>';
-      return;
-    }
-    list.innerHTML = '';
-    for (const c of found) {
-      const item = document.createElement('li');
-      item.innerHTML = `<button type="button">${escapeHtml(c.label)}<small>${escapeHtml(c.detail)}</small></button>`;
-      item.querySelector('button').addEventListener('click', () => {
-        list.hidden = true;
-        switchCity(() => loadOsmCity(c, $('detail').value));
-      });
-      list.appendChild(item);
-    }
-  } catch (err) {
-    list.innerHTML = `<li class="empty">Search failed: ${escapeHtml(err.message)}</li>`;
-  }
-});
-
-async function switchCity(load, friends = null) {
-  pause();
-  const prev = { city: state.city, graph: state.graph };
-  const names = state.friends.map((f) => f.name);
-  state.loading = true;
-  $('city-note').textContent = '';
-  $('city-note').classList.remove('error');
-  try {
-    await load();
-    if (friends) setFriends(friends);
-    else if (state.city.defaults) setFriends(state.city.defaults.map((f) => ({ ...f })));
-    else setFriends(spreadFriends(Math.max(MIN_FRIENDS, names.length || 4), names));
-    state.t = 0;
-    state.timeline = null;
-    compute();
-    renderFriends();
-    fillPlaceNames(state.friends);
-    hideStatus();
-    state.loading = false;
-    writeHash();
-    play();
-  } catch (err) {
-    console.error(err);
-    state.loading = false;
-    if (prev.city) {
-      // stay on the previous city
-      state.city = prev.city;
-      state.graph = prev.graph;
-      renderer.setCity(prev.city, prev.graph);
-      renderer.setResult(state.result, state.friends);
-      renderCityOptions();
-      hideStatus();
-      draw();
-      $('city-note').textContent = err.message;
-      $('city-note').classList.add('error');
-    } else {
-      setStatus(err.message, { error: true });
-    }
-  }
-}
+$('find').addEventListener('click', findMeeting);
+$('example').addEventListener('click', () => loadExample());
 
 $('play').addEventListener('click', () => (state.playing ? pause() : play()));
 
@@ -783,14 +1052,14 @@ $('share').addEventListener('click', async () => {
   writeHash();
   try {
     await navigator.clipboard.writeText(location.href);
-    $('record-note').textContent = 'Link copied. It opens this city with these friends.';
+    setNote('record-note', 'Link copied. It opens these starting points on this map.');
   } catch {
-    $('record-note').textContent = location.href;
+    setNote('record-note', location.href);
   }
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.target.closest('input, select, textarea')) return;
+  if (e.target.closest('input, select, textarea, button')) return;
   if (e.code === 'Space') {
     e.preventDefault();
     state.playing ? pause() : play();
@@ -804,7 +1073,7 @@ document.addEventListener('keydown', (e) => {
 
 if (!recordingSupported()) {
   $('record').disabled = true;
-  $('record-note').textContent = 'Video recording is not supported in this browser.';
+  setNote('record-note', 'This browser cannot record the canvas to video');
 }
 
 $('record').addEventListener('click', async () => {
@@ -822,13 +1091,13 @@ $('record').addEventListener('click', async () => {
   try {
     state.recording = new CanvasRecorder(canvas, 60);
   } catch (err) {
-    $('record-note').textContent = `Could not start recording: ${err.message}`;
+    setNote('record-note', `Could not start recording: ${err.message}`, true);
     return;
   }
   state.recording.start();
   $('record').textContent = 'Stop recording';
   $('record').classList.add('recording');
-  $('record-note').textContent = 'Recording… keep this tab visible until it finishes.';
+  setNote('record-note', 'Recording. Keep this tab visible until it finishes.');
   play();
 });
 
@@ -844,27 +1113,25 @@ async function finishRecording() {
   const blob = await rec.stop();
   $('record').textContent = 'Record video';
   $('record').classList.remove('recording');
-  const name = `tempo-${state.city.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.${rec.ext}`;
+  const name = `tempo-${state.city.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meetup'}.${rec.ext}`;
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = name;
   a.click();
-  $('record-note').innerHTML = `Saved <a href="${url}" download="${name}">${name}</a> (${(blob.size / 1e6).toFixed(1)} MB, 1080×1920).`;
+  $('record-note').classList.remove('error');
+  $('record-note').innerHTML = `Saved <a class="link" href="${url}" download="${name}">${name}</a>, ${(blob.size / 1e6).toFixed(1)} MB at 1080 × 1920`;
 }
 
 // ---------------------------------------------------------------------------
-// shareable links: #city=tokyo&f=name,place,lat,lon;...
+// shareable links: #area=tokyo&name=Tokyo&f=name,place,lat,lon;...
 
 function writeHash() {
   if (!state.city || state.loading) return;
-  const parts = [`city=${encodeURIComponent(state.city.id)}`];
-  if (state.city.detail) parts.push(`detail=${state.city.detail}`);
+  const parts = [`area=${encodeURIComponent(state.city.id)}`, `name=${encodeURIComponent(state.city.name)}`];
+  const list = state.friends.filter(located);
   parts.push(
-    'f=' +
-      state.friends
-        .map((f) => [f.name, f.place || '', f.lat.toFixed(5), f.lon.toFixed(5)].map(encodeURIComponent).join(','))
-        .join(';'),
+    'f=' + list.map((f) => [f.name, f.query || f.place || '', f.lat.toFixed(5), f.lon.toFixed(5)].map(encodeURIComponent).join(',')).join(';'),
   );
   history.replaceState(null, '', `#${parts.join('&')}`);
 }
@@ -882,17 +1149,26 @@ function readHash() {
       .map((s) => s.split(',').map(decodeURIComponent))
       .filter((a) => a.length === 4 && isFinite(+a[2]) && isFinite(+a[3]))
       .slice(0, MAX_FRIENDS)
-      .map(([name, place, lat, lon], i) => ({ name, place, lat: +lat, lon: +lon, color: COLORS[i] }));
+      .map(([name, query, lat, lon], i) => ({
+        name,
+        query,
+        place: shortPlace(query, query),
+        lat: +lat,
+        lon: +lon,
+        status: 'found',
+        color: LINE_COLORS[i],
+      }));
     if (friends.length < MIN_FRIENDS) friends = null;
   }
-  return { city: out.city ? decodeURIComponent(out.city) : null, detail: out.detail, friends };
+  const area = out.area || out.city; // "city" was used by earlier links
+  return { area: area ? decodeURIComponent(area) : null, name: out.name ? decodeURIComponent(out.name) : '', friends };
 }
 
 // ---------------------------------------------------------------------------
 // start
 
 async function loadFonts() {
-  const faces = [`900 68px ${FONT_SANS}`, `800 62px ${FONT_SANS}`, `700 36px ${FONT_SANS}`, `600 32px ${FONT_SANS}`, `500 23px ${FONT_SANS}`, `700 52px ${FONT_MONO}`];
+  const faces = [`500 60px ${FONT_SANS}`, `400 32px ${FONT_SANS}`, `500 52px ${FONT_MONO}`, `400 22px ${FONT_SANS}`];
   const timeout = new Promise((r) => setTimeout(r, 2500));
   try {
     await Promise.race([Promise.all(faces.map((f) => document.fonts.load(f))), timeout]);
@@ -901,27 +1177,69 @@ async function loadFonts() {
   }
 }
 
-async function start() {
-  renderCityOptions();
-  renderFriends();
-  setStatus('Loading…');
-  await loadFonts();
-  const hash = readHash();
-  if (hash.city && hash.city.startsWith('osm:')) {
-    const [, type, id] = hash.city.split(':');
-    await switchCity(async () => {
-      setStatus('Looking up the city…');
-      const place = await lookupCity(type, id);
-      await loadOsmCity(place, hash.detail || 'auto');
-    }, hash.friends);
-    if (!state.graph) {
-      // fall back to the bundled city
-      await switchCity(() => loadPreset(PRESETS[0].id));
-    }
-  } else {
-    const id = PRESETS.some((p) => p.id === hash.city) ? hash.city : PRESETS[0].id;
-    await switchCity(() => loadPreset(id), hash.friends);
+function setFriends(list) {
+  state.friends.length = 0;
+  list.forEach((f, i) => state.friends.push(newFriend({ ...f, color: f.color || LINE_COLORS[i % LINE_COLORS.length] })));
+  state.selected = -1;
+}
+
+async function loadExample() {
+  pause();
+  state.loading = true;
+  try {
+    await loadPreset('tokyo');
+    const meta = await loadPresetMeta('tokyo');
+    setFriends(meta.friends.map((f) => ({ name: f.name, query: f.place, place: f.place, lat: f.lat, lon: f.lon, status: 'found' })));
+    state.t = 0;
+    state.timeline = null;
+    compute();
+    renderFriends();
+    hideStatus();
+    state.loading = false;
+    writeHash();
+    play();
+  } catch (err) {
+    state.loading = false;
+    setStatus(err.message, { error: true });
   }
 }
+
+async function start() {
+  // two empty rows to type into, even if nothing else loads
+  setFriends([{}, {}]);
+  renderFriends();
+  setStatus('Loading');
+  await loadFonts();
+  const hash = readHash();
+  if (!hash.friends) return loadExample();
+
+  setFriends(hash.friends);
+  renderFriends();
+  state.loading = true;
+  try {
+    if (hash.area && PRESETS.some((p) => p.id === hash.area)) await loadPreset(hash.area);
+    else if (hash.area && hash.area.startsWith('box:')) await loadArea(boxFromId(hash.area, hash.name || 'Your meetup'));
+    else if (hash.area && hash.area.startsWith('osm:')) {
+      const [, type, id] = hash.area.split(':');
+      setStatus('Looking up the area');
+      await loadArea(cityPlace(await lookupCity(type, id)));
+    } else await ensureArea(state.friends.filter(located));
+    state.t = 0;
+    compute();
+    hideStatus();
+    state.loading = false;
+    renderFriends();
+    play();
+  } catch (err) {
+    console.error(err);
+    state.loading = false;
+    hideStatus();
+    setNote('find-note', `Could not open this link: ${err.message}`, true);
+    await loadExample();
+  }
+}
+
+// opt-in hook for automated tests: ?debug
+if (new URLSearchParams(location.search).has('debug')) window.__tempo = { state, renderer };
 
 start();

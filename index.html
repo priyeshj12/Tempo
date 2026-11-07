@@ -4,31 +4,31 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Tempo: where should friends meet?</title>
-  <meta name="description" content="Pick a city, drop your friends on the map and watch real road networks flood to find the fairest place to meet.">
-  <meta name="theme-color" content="#000000">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23000'/%3E%3Ccircle cx='11' cy='12' r='5' fill='%23ff4fa3'/%3E%3Ccircle cx='21' cy='12' r='5' fill='%2334e3b0'/%3E%3Ccircle cx='16' cy='21' r='5' fill='%234d7cff'/%3E%3C/svg%3E">
+  <meta name="description" content="Add where each friend is starting from. Tempo spreads out along real streets to find the fairest place to meet, then suggests where to eat, what to do and where to sit back.">
+  <meta name="theme-color" content="#0b0d14">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2307080d'/%3E%3Cpath d='M6 22h20M16 6v20' stroke='%23f2a541' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='22' r='5' fill='%23eef0f5'/%3E%3Ccircle cx='16' cy='22' r='2' fill='%2307080d'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800;900&family=JetBrains+Mono:wght@700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <main class="app">
-    <section class="stage-col" aria-label="Animation">
+    <section class="stage-col" aria-label="Map animation">
       <div class="stage" id="stage-box">
-        <canvas id="stage" width="1080" height="1920" aria-label="Map animation of friends' road searches"></canvas>
+        <canvas id="stage" width="1080" height="1920" aria-label="Map of each friend's search spreading along the streets"></canvas>
         <div class="stage-status" id="status" hidden>
           <div class="spinner" aria-hidden="true"></div>
-          <p id="status-text">Loading…</p>
+          <p id="status-text">Loading</p>
         </div>
       </div>
       <div class="transport">
-        <button class="btn icon-btn primary" id="play" aria-label="Play">
-          <svg viewBox="0 0 24 24" class="i-play" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
-          <svg viewBox="0 0 24 24" class="i-pause" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
+        <button class="btn icon-btn" id="play" aria-label="Play">
+          <svg viewBox="0 0 24 24" class="i-play" aria-hidden="true"><path d="M7 5.5v13l11-6.5z"/></svg>
+          <svg viewBox="0 0 24 24" class="i-pause" aria-hidden="true"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>
         </button>
         <input type="range" id="scrub" min="0" max="1" step="0.001" value="0" aria-label="Timeline">
-        <span class="time" id="time">0.0s</span>
+        <span class="time" id="time">0.0 s</span>
         <select id="speed" aria-label="Speed">
           <option value="0.5">0.5×</option>
           <option value="1" selected>1×</option>
@@ -40,43 +40,33 @@
 
     <aside class="panel">
       <header class="intro">
-        <h1><span class="mark" aria-hidden="true"></span>Tempo</h1>
-        <p>Drop friends anywhere in a city. Tempo floods the real road network from each of them to find the fairest place to meet, and shows why searching <em>all at once</em> beats searching <em>one by one</em>.</p>
+        <p class="wordmark">Tempo</p>
+        <h1>Where should your friends meet?</h1>
+        <p class="lede">Add where everyone is starting from. Tempo spreads out from each of them along real streets, finds the spot where the longest trip is as short as it can be, and suggests what to do there.</p>
       </header>
 
-      <section class="card">
-        <h2>City</h2>
-        <div class="row">
-          <select id="city" aria-label="City"></select>
-        </div>
-        <form class="search" id="city-search" autocomplete="off">
-          <input type="search" id="city-q" placeholder="Search any city or district…" aria-label="Search for a city">
-          <select id="detail" aria-label="Road detail" title="Road detail">
-            <option value="auto">Auto detail</option>
-            <option value="all">All streets</option>
-            <option value="main">Main roads</option>
-            <option value="major">Major roads</option>
-          </select>
-        </form>
-        <ul class="results" id="city-results" hidden></ul>
-        <p class="note" id="city-note"></p>
-      </section>
-
-      <section class="card">
-        <div class="card-head">
-          <h2>Friends</h2>
-          <button class="btn small" id="add-friend">+ Add friend</button>
+      <section class="block" id="friends-block" aria-labelledby="friends-h">
+        <div class="block-head">
+          <h2 id="friends-h">Starting points</h2>
+          <span class="meta" id="friend-count"></span>
         </div>
         <ul class="friends" id="friends"></ul>
-        <p class="note">Drag a marker on the map, or select a friend and click the map to move them.</p>
+        <button class="btn quiet" id="add-friend">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          Add a friend
+        </button>
+        <button class="btn primary wide" id="find">Find where to meet</button>
+        <p class="note" id="find-note" role="status"></p>
+        <p class="note">Or <button class="link" id="example">load the Tokyo example</button></p>
       </section>
 
-      <section class="card" id="result-card" hidden>
-        <h2>Meeting point</h2>
-        <p class="meet-name" id="meet-name">…</p>
-        <p class="note" id="meet-where"></p>
+      <section class="block" id="result" hidden aria-labelledby="result-h">
+        <h2 id="result-h">Where to meet</h2>
+        <p class="meet-name" id="meet-name"></p>
+        <p class="zone-line" id="meet-zone"></p>
         <ul class="trips" id="trips"></ul>
         <div class="compare">
+          <h3>Roads checked</h3>
           <div class="bar-row">
             <span>One by one</span>
             <div class="bar"><i id="bar-sep"></i></div>
@@ -91,22 +81,33 @@
         </div>
       </section>
 
-      <section class="card">
-        <h2>Video</h2>
+      <section class="block" id="todo" hidden aria-labelledby="todo-h">
+        <div class="block-head">
+          <h2 id="todo-h">Things to do nearby</h2>
+          <a class="meta" id="todo-map" target="_blank" rel="noopener">Open map</a>
+        </div>
+        <div class="tabs" role="tablist" id="tabs"></div>
+        <ul class="places" id="places" role="tabpanel" aria-labelledby="todo-h"></ul>
+        <p class="note" id="places-note" role="status"></p>
+      </section>
+
+      <section class="block" id="video-block" aria-labelledby="video-h">
+        <h2 id="video-h">Video</h2>
         <label class="check"><input type="checkbox" id="show-separate" checked> Show the one-by-one searches first</label>
-        <div class="row buttons">
+        <div class="row">
           <button class="btn" id="record">Record video</button>
           <button class="btn" id="share">Copy link</button>
         </div>
-        <p class="note" id="record-note"></p>
+        <p class="note" id="record-note" role="status"></p>
       </section>
 
-      <details class="card how">
+      <details class="block how">
         <summary>How it works</summary>
-        <p>Each friend's search is Dijkstra's algorithm on the road graph: it spreads out along streets in order of distance, like water flooding the city.</p>
-        <p><strong>One by one:</strong> without knowing where everyone will end up, each search must cover the whole city before you can compare distances.</p>
-        <p><strong>All at once:</strong> the searches take turns, always growing whichever front is closest. The first junction that every flood has reached is the place that keeps the longest trip as short as possible, so the search can stop right there.</p>
-        <p>Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>. Places by Nominatim, other cities by the Overpass API.</p>
+        <p>Each friend's search is Dijkstra's algorithm on the road network. It spreads along the streets in order of distance, like water flooding the city.</p>
+        <p><strong>One by one:</strong> without knowing where everyone will end up, each search has to cover the whole map before the distances can be compared.</p>
+        <p><strong>All at once:</strong> the searches take turns, always growing whichever front is closest. The first junction every flood reaches is the place where the longest trip is as short as possible, so the search stops there.</p>
+        <p>The lit streets around it are almost as fair, so pick whichever spot suits you. Places to go come from OpenStreetMap and are ranked by how far they are to walk.</p>
+        <p>Map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>. Search by Nominatim, streets and places by the Overpass API.</p>
       </details>
     </aside>
   </main>

@@ -5,6 +5,7 @@ import { finalizeGraph, encodeGraph, decodeGraph } from '../src/graph.js';
 import { dijkstra, meetSearch, solve, tracePath } from '../src/search.js';
 import { buildGraph } from '../src/graph.js';
 import { makeProjection, PolygonIndex, simplifyFlat, landOutline, ringsArea } from '../src/geo.js';
+import { classify, rankPlaces } from '../src/places.js';
 
 // deterministic PRNG
 function rng(seed) {
@@ -76,6 +77,28 @@ test('meetSearch finds the node minimising the longest trip', () => {
       const path = tracePath(g, res.pred[i], res.meet);
       assert.ok(Math.abs(path.length - full[i][res.meet]) < 1e-2);
     }
+  }
+});
+
+test('the meeting zone holds every node within the slack, and nothing else', () => {
+  for (let seed = 3; seed <= 12; seed++) {
+    const g = randomGraph(400, 600, seed);
+    const r = rng(seed * 11);
+    const k = 2 + (seed % 9); // up to 10 friends
+    const sources = Array.from({ length: k }, () => Math.floor(r() * g.nNodes));
+    const full = sources.map((s) => dijkstra(g, s).dist);
+    const plain = meetSearch(g, sources);
+    const res = meetSearch(g, sources, { slack: () => 150 });
+    assert.equal(res.meet, plain.meet);
+    assert.ok(Math.abs(res.zoneLimit - (plain.radius + 150)) < 1e-6);
+    const expected = [];
+    for (let v = 0; v < g.nNodes; v++) {
+      let worst = 0;
+      for (const d of full) worst = Math.max(worst, d[v]);
+      if (worst <= res.zoneLimit + 1e-9) expected.push(v);
+    }
+    assert.deepEqual(Array.from(res.zone), expected, `seed ${seed}`);
+    assert.ok(res.zone.includes(res.meet));
   }
 });
 
@@ -167,6 +190,53 @@ test('landOutline traces a road grid and respects the boundary', () => {
   const half = new PolygonIndex([[-500, -500, 1000, -500, 1000, 2500, -500, 2500, -500, -500]]);
   const clipped = ringsArea(landOutline(g, half));
   assert.ok(clipped < area * 0.65, `clipped ${clipped} vs ${area}`);
+});
+
+test('places are classified into the four groups', () => {
+  assert.deepEqual(classify({ name: 'Ichiran', amenity: 'restaurant', cuisine: 'ramen;noodle' }), { category: 'eat', kind: 'Ramen' });
+  assert.deepEqual(classify({ name: 'Blue Bottle', amenity: 'cafe', cuisine: 'coffee_shop' }), { category: 'eat', kind: 'Café' });
+  assert.deepEqual(classify({ name: 'Port Bowl', leisure: 'bowling_alley' }), { category: 'activity', kind: 'Bowling' });
+  assert.deepEqual(classify({ name: 'B-Pump', leisure: 'sports_centre', sport: 'climbing' }), { category: 'activity', kind: 'Climbing' });
+  assert.deepEqual(classify({ name: 'Mori Art Museum', tourism: 'museum' }), { category: 'sightseeing', kind: 'Museum' });
+  assert.deepEqual(classify({ name: 'Zojoji', amenity: 'place_of_worship', religion: 'buddhist', wikidata: 'Q1' }), { category: 'sightseeing', kind: 'Temple' });
+  assert.deepEqual(classify({ name: 'Shiba Park', leisure: 'park' }), { category: 'chill', kind: 'Park' });
+  assert.deepEqual(classify({ name: 'The Pub', amenity: 'pub' }), { category: 'chill', kind: 'Pub' });
+  // small plaques and unnamed things are left out
+  assert.equal(classify({ name: 'Stone', historic: 'memorial' }), null);
+  assert.equal(classify({ amenity: 'restaurant' }), null);
+  assert.equal(classify({ name: 'Gym', leisure: 'sports_centre' }), null);
+});
+
+test('places are ranked by walking distance on the road graph', () => {
+  // a straight street from x = 0 to x = 2000 m along the equator
+  const n = 21;
+  const nodeX = Float32Array.from({ length: n }, (_, i) => i * 100);
+  const nodeY = new Float32Array(n);
+  const U = [], V = [];
+  for (let i = 1; i < n; i++) { U.push(i - 1); V.push(i); }
+  const g = finalizeGraph({
+    lon0: 0, lat0: 0, nodeX, nodeY,
+    edgeU: Uint32Array.from(U), edgeV: Uint32Array.from(V),
+    edgeLen: new Float32Array(U.length).fill(100),
+    geomStart: new Uint32Array(U.length + 1), geomXY: new Float32Array(0),
+  });
+  const walk = dijkstra(g, 0).dist;
+  const at = (x) => g.proj.inv(x, 20);
+  const el = (id, x, tags) => { const [lon, lat] = at(x); return { type: 'node', id, lat, lon, tags }; };
+  const groups = rankPlaces([
+    el(1, 1500, { name: 'Far Noodles', amenity: 'restaurant', cuisine: 'ramen' }),
+    el(2, 300, { name: 'Near Noodles', amenity: 'restaurant', cuisine: 'ramen' }),
+    el(3, 600, { name: 'Mid Noodles', amenity: 'restaurant', cuisine: 'ramen' }),
+    el(4, 900, { name: 'Café', amenity: 'cafe' }),
+    el(5, 900, { name: 'Park', leisure: 'park' }),
+    el(6, 800, { name: 'Famous Park', leisure: 'park', wikidata: 'Q2' }),
+  ], { graph: g, walk });
+  // nearest first, and at most two places of the same kind of food
+  assert.deepEqual(groups.eat.map((p) => p.name), ['Near Noodles', 'Mid Noodles', 'Café']);
+  assert.equal(groups.eat[0].minutes, 4);
+  // a well known park beats a slightly closer plain one
+  assert.deepEqual(groups.chill.map((p) => p.name), ['Famous Park', 'Park']);
+  assert.deepEqual(groups.activity, []);
 });
 
 const tokyo = new URL('../data/tokyo.tmpo', import.meta.url);
