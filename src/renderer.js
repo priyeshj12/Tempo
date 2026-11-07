@@ -308,17 +308,71 @@ export class Renderer {
       separate: result.separate.map((f, i) => new FloodPlayer(f, geo, friends[i].color)),
       together: result.together.map((f, i) => new FloodPlayer(f, geo, friends[i].color)),
     };
-    this.routes = result.paths.map((p) => {
-      const pts = [];
-      let len = 0;
-      for (let i = 0; i < p.pts.length; i += 2) {
-        const [x, y] = this.toScreen(p.pts[i], p.pts[i + 1]);
-        if (pts.length) len += Math.hypot(x - pts[pts.length - 2], y - pts[pts.length - 1]);
-        pts.push(x, y);
-      }
-      return { pts, len };
-    });
+    this.routes = result.paths.map((p) => this.screenRoute(p));
+    this.target = null;
     this.resetLayers();
+  }
+
+  /** A path in metres as a polyline on the stage, with its length. */
+  screenRoute(p) {
+    const pts = [];
+    let len = 0;
+    for (let i = 0; i < p.pts.length; i += 2) {
+      const [x, y] = this.toScreen(p.pts[i], p.pts[i + 1]);
+      if (pts.length) len += Math.hypot(x - pts[pts.length - 2], y - pts[pts.length - 1]);
+      pts.push(x, y);
+    }
+    return { pts, len };
+  }
+
+  /**
+   * A place the friends could go instead: its routes replace the ones to
+   * the meeting point in the finished picture. null clears it.
+   */
+  setTarget(t) {
+    if (!t || !this.geo) {
+      this.target = null;
+      return;
+    }
+    this.target = { ...t, routes: t.paths.map((p) => this.screenRoute(p)), x: this.geo.nx[t.node], y: this.geo.ny[t.node] };
+  }
+
+  /** Where the sign above a chosen place goes. */
+  targetSign(ctx) {
+    const t = this.target;
+    ctx.save();
+    ctx.font = `500 28px ${FONT_SANS}`;
+    const w = ctx.measureText(t.name).width + 32;
+    ctx.restore();
+    const h = 48;
+    return { x: Math.max(16, Math.min(STAGE_W - 16 - w, t.x - w / 2)), y: t.y - 36 - h, w, h };
+  }
+
+  drawTarget(ctx, st) {
+    const t = this.target;
+    const k = easeOut(st.routes);
+    ctx.save();
+    for (const [r, c] of [[24, INK_DEEP], [19, ACCENT], [7, INK_DEEP]]) {
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, r * k, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const sign = this.targetSign(ctx);
+    ctx.globalAlpha = clamp01(st.routes * 1.5);
+    ctx.beginPath();
+    ctx.roundRect(sign.x, sign.y, sign.w, sign.h, 8);
+    ctx.fillStyle = INK_CARD;
+    ctx.fill();
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.font = `500 28px ${FONT_SANS}`;
+    ctx.fillStyle = TEXT1;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(t.name, sign.x + 16, sign.y + sign.h / 2 + 1);
+    ctx.restore();
   }
 
   resetLayers() {
@@ -441,6 +495,7 @@ export class Renderer {
 
     this.drawFriends(ctx, st, ui);
     if (st && st.meetIn > 0) this.drawMeet(ctx, st, ui.meetName);
+    if (st && this.target && st.routes > 0) this.drawTarget(ctx, st);
     this.drawCaptions(ctx, st, ui);
     ctx.restore();
   }
@@ -469,7 +524,7 @@ export class Renderer {
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    this.routes.forEach((route, i) => {
+    (this.target ? this.target.routes : this.routes).forEach((route, i) => {
       const path = new Path2D();
       const target = route.len * smooth(progress);
       const p = route.pts;
@@ -575,12 +630,16 @@ export class Renderer {
       const [mx, my] = this.meetScreen();
       const sign = this.meetSign(ctx, ui.meetName);
       taken.push({ x: mx - 32, y: my - 32, w: 64, h: 64, owner: -1 }, { ...sign, owner: -1 });
+      if (this.target) {
+        taken.push({ x: this.target.x - 26, y: this.target.y - 26, w: 52, h: 52, owner: -1 }, { ...this.targetSign(ctx), owner: -1 });
+      }
     }
     ctx.save();
     for (const m of shown) {
       const { f, i, x, y, rad } = m;
       const name = this.nameOf(f);
-      const detail = showDist ? `${(this.result.paths[i].length / 1000).toFixed(1)} km` : f.place || '';
+      const trip = this.target ? this.target.km[i] : this.result?.paths[i].length / 1000;
+      const detail = showDist ? `${trip.toFixed(1)} km` : f.place || '';
       ctx.font = `500 25px ${FONT_SANS}`;
       const wName = ctx.measureText(name).width;
       ctx.font = showDist ? `500 23px ${FONT_MONO}` : `400 23px ${FONT_SANS}`;
@@ -668,7 +727,7 @@ export class Renderer {
       ctx.fillText(ellipsize(ctx, p.name, colW), x, top + 58);
       ctx.font = `400 22px ${FONT_MONO}`;
       ctx.fillStyle = TEXT2;
-      ctx.fillText(`${p.minutes} min walk`, x, top + 88);
+      ctx.fillText(ellipsize(ctx, p.detail || '', colW), x, top + 88);
     });
     ctx.restore();
   }
@@ -708,7 +767,8 @@ export class Renderer {
       ctx.fillStyle = TEXT1;
       fitText(ctx, st.title, L, 196, R - L - figW - 32);
       let sub = st.subtitle;
-      if (sub === '@meet') sub = ui.meetName ? `Meet around ${ui.meetName}` : 'The fairest spot for everyone';
+      if (sub === '@meet' && this.target && st.routes > 0) sub = `Going to ${this.target.name}`;
+      else if (sub === '@meet') sub = ui.meetName ? `Meet around ${ui.meetName}` : 'The fairest spot for everyone';
       ctx.font = `400 32px ${FONT_SANS}`;
       ctx.fillStyle = TEXT2;
       fitText(ctx, sub, L, 276, R - L);
@@ -727,7 +787,10 @@ export class Renderer {
         ctx.font = `400 24px ${FONT_SANS}`;
         ctx.fillStyle = TEXT2;
         ctx.textBaseline = 'middle';
-        fitText(ctx, `On the lit streets nobody travels more than ${(this.result.zoneLimit / 1000).toFixed(1)} km`, L + 40, 1676, R - L - 40);
+        const legend = this.target && st.routes > 0
+          ? `Longest trip ${this.target.longest.toFixed(1)} km, ${this.target.extra < 0.3 ? 'no longer than at the fairest spot' : `${this.target.extra.toFixed(1)} km more than at the fairest spot`}`
+          : `On the lit streets nobody travels more than ${(this.result.zoneLimit / 1000).toFixed(1)} km`;
+        fitText(ctx, legend, L + 40, 1676, R - L - 40);
         ctx.textBaseline = 'alphabetic';
         ctx.globalAlpha = 1;
       }

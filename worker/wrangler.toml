@@ -1,0 +1,10 @@
+# Tempo places proxy. Deploy with: npx wrangler deploy (from this folder)
+# Secrets, set once:
+#   npx wrangler secret put GOOGLE_PLACES_KEY
+#   npx wrangler secret put TRIPADVISOR_KEY
+name = "tempo-places"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://priyeshj12.github.io,http://localhost:8000"

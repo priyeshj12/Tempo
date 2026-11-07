@@ -47,10 +47,16 @@ jobs:
 
       - name: Collect the site
         if: steps.pages.outputs.enabled == 'true'
+        env:
+          PLACES_API_URL: ${{ vars.PLACES_API_URL }}
         run: |
           mkdir _site
-          cp -r index.html styles.css src data _site/
+          cp -r index.html styles.css config.js src data _site/
           touch _site/.nojekyll
+          # the places proxy's address, from the PLACES_API_URL repository variable
+          if [ -n "$PLACES_API_URL" ]; then
+            printf "window.TEMPO_PLACES_API = %s;\n" "$(node -e 'console.log(JSON.stringify(process.env.PLACES_API_URL.replace(/\/+$/, "")))')" > _site/config.js
+          fi
 
       - if: steps.pages.outputs.enabled == 'true'
         uses: actions/configure-pages@v5

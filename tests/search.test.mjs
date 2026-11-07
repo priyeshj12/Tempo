@@ -5,7 +5,7 @@ import { finalizeGraph, encodeGraph, decodeGraph } from '../src/graph.js';
 import { dijkstra, meetSearch, solve, tracePath } from '../src/search.js';
 import { buildGraph } from '../src/graph.js';
 import { makeProjection, PolygonIndex, simplifyFlat, landOutline, ringsArea } from '../src/geo.js';
-import { classify, rankPlaces } from '../src/places.js';
+import { classify, rankPlaces, rankByTrip, quality, STARS_PER_EXTRA_KM } from '../src/places.js';
 import { makeBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from '../src/offline.js';
 import { connectTiles, toElements, tileLonLat } from '../src/tiles.js';
 
@@ -239,6 +239,36 @@ test('places are ranked by walking distance on the road graph', () => {
   // a well known park beats a slightly closer plain one
   assert.deepEqual(groups.chill.map((p) => p.name), ['Famous Park', 'Park']);
   assert.deepEqual(groups.activity, []);
+});
+
+test('a better place a little further away beats a plain one at the meeting point', () => {
+  // a 10 km street with two friends at its ends; the fairest spot is the middle
+  const n = 101;
+  const nodeX = Float32Array.from({ length: n }, (_, i) => i * 100);
+  const U = [], V = [];
+  for (let i = 1; i < n; i++) { U.push(i - 1); V.push(i); }
+  const g = finalizeGraph({
+    lon0: 0, lat0: 0, nodeX, nodeY: new Float32Array(n),
+    edgeU: Uint32Array.from(U), edgeV: Uint32Array.from(V),
+    edgeLen: new Float32Array(U.length).fill(100),
+    geomStart: new Uint32Array(U.length + 1), geomXY: new Float32Array(0),
+  });
+  const trips = [dijkstra(g, 0).dist, dijkstra(g, n - 1).dist];
+  const at = (x) => { const [lon, lat] = g.proj.inv(x, 0); return { lat, lon }; };
+  const groups = rankByTrip([
+    { category: 'eat', name: 'Plain Diner', rating: 4.0, reviews: 120, ...at(5000) },
+    { category: 'eat', name: 'Great Bistro', rating: 4.8, reviews: 3000, ...at(6000) },
+    { category: 'eat', name: 'Far Legend', rating: 5.0, reviews: 9000, ...at(9900) },
+    { category: 'chill', name: 'Park', notable: true, park: true, area: 80000, ...at(5200) },
+  ], { graph: g, trips, fairest: 5000 });
+  assert.deepEqual(groups.eat.map((p) => p.name), ['Great Bistro', 'Plain Diner']);
+  const bistro = groups.eat[0];
+  assert.deepEqual(bistro.km.map((k) => +k.toFixed(1)), [6, 4]);
+  assert.ok(Math.abs(bistro.extra - 1) < 1e-6);
+  assert.ok(Math.abs(bistro.score - (bistro.fun - STARS_PER_EXTRA_KM)) < 1e-9);
+  assert.equal(groups.chill[0].name, 'Park');
+  // rating counts more when many people rated it
+  assert.ok(quality({ rating: 4.6, reviews: 2000 }) > quality({ rating: 4.9, reviews: 5 }));
 });
 
 test('offline search finds stations, spelling variants and nearby names', () => {

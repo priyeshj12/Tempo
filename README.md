@@ -14,7 +14,8 @@
 3. **One by one.** A full Dijkstra search from each friend. Without knowing where everyone will end up, each search has to cover the whole map.
 4. **All at once.** The searches take turns, always growing whichever front is closest. The first junction every flood reaches is where the longest trip is as short as possible, so the search stops there. In the Tokyo example that checks 64% fewer roads.
 5. **Where to meet.** The searches carry on a little further to light up every street where nobody travels more than about 6% further (250 m to 1.5 km), so you can pick any spot in that zone. The centre is named after the closest station or park.
-6. **Things to do.** Named places within a short walk, in four groups: Eat, Activity, Sightseeing and Chill. They show at once from the map tiles, then the Overpass API's richer details (cuisines, well known places) are merged in when they arrive. They are ranked by walking distance along the streets, with a nudge towards well known places and bigger parks, and the top pick of each group appears in the video.
+6. **Things to do.** Four groups: **Eat** (Google Maps ratings), **Activity** and **Sightseeing** (Tripadvisor ratings), and **Chill**: somewhere to spend an hour together with nothing to plan, like parks and waterfronts, viewpoints, bathhouses and spas, tea houses and easy-going bars (Google Maps ratings). The search reaches further when friends are further apart (30% of the longest trip, 1.5 to 8 km), because a great place a little further away beats a plain one next door.
+7. **Worth the trip?** Every place is scored as rating, pulled towards average when few people rated it, plus a little for popularity, minus 0.15 stars for each kilometre it adds to the longest trip. Each place shows every friend's trip to it and how much longer the longest trip gets than at the fairest spot. Choosing a place draws everyone's route to it on the map and in the video. Without the ratings proxy, places come from OpenStreetMap (map tiles at once, Overpass details when they arrive), scored by how well known they are.
 
 ## Using it
 
@@ -34,6 +35,18 @@ npm test           # unit tests (Node 20+)
 
 Any static host works. Outside Tokyo the browser needs to reach `photon.komoot.io`, `tiles.openfreemap.org`, `nominatim.openstreetmap.org` and the Overpass API.
 
+## Ratings from Google and Tripadvisor (optional)
+
+Both companies' API keys must stay off the page (Tripadvisor's terms say so outright), so ratings go through a small proxy in `worker/`, a Cloudflare Worker. It answers only the origins in `worker/wrangler.toml`, makes two Google calls and two Tripadvisor calls per meetup, and caches nothing, as Tripadvisor's caching policy requires. Without it, Tempo uses OpenStreetMap.
+
+1. **Google:** in Google Cloud, create a project with billing on, enable **Places API (New)**, create an API key and restrict it to that API. Ratings and review counts bill as *Nearby Search Enterprise*; check the current free allowance on Google's pricing page.
+2. **Tripadvisor:** get a key for the Terra API (docs.terra.tripadvisor.com). Its nearby search only returns places on your account's allowlist, and its brand guidelines say how ratings must be credited. Without this key the proxy uses Google for activities and sightseeing too.
+3. **Cloudflare:** a free account, an API token with the *Edit Cloudflare Workers* template, and your account ID.
+4. **GitHub:** add the repository secrets `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GOOGLE_PLACES_KEY` and `TRIPADVISOR_KEY`, then run **Deploy the places proxy** in the Actions tab. It prints the worker's address, like `https://tempo-places.<you>.workers.dev`.
+5. Add that address as the repository variable `PLACES_API_URL` (Settings > Secrets and variables > Actions > Variables) and run **Deploy to GitHub Pages** again.
+
+To run the proxy locally: `cd worker && npx wrangler dev`, with the keys in `worker/.dev.vars`, and set `window.TEMPO_PLACES_API` in `config.js`.
+
 ## Putting it on the web (GitHub Pages)
 
 `.github/workflows/pages.yml` runs the tests and deploys the site on every push to the default branch. It needs two one-time settings:
@@ -49,7 +62,8 @@ Then run the workflow from the Actions tab (Deploy to GitHub Pages > Run workflo
 | --- | --- |
 | `src/main.js` | App state, starting points, choosing the area, results, sharing and recording |
 | `src/search.js` | Dijkstra, the simultaneous multi-source search with its meeting zone, and `Flood` replay data |
-| `src/places.js` | Places from Overpass or map tiles, their four groups and ranking by walking distance |
+| `src/places.js` | Places from the proxy, Overpass or map tiles, their four groups, and ranking by rating against extra travel |
+| `worker/src/index.js` | The ratings proxy: Google Places and Tripadvisor, with the keys kept on the server |
 | `src/tiles.js` | Vector tile reader and junction rebuilding for streets from OpenFreeMap |
 | `src/offline.js` | The bundled Tokyo places and search, used when live services cannot be reached |
 | `src/graph.js` | Builds an intersection-to-intersection road graph from OSM ways, binary format, nearest-node grid |
@@ -84,4 +98,4 @@ To use a new preset, add it to `PRESETS` in `src/main.js`.
 
 ## Data
 
-Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available under the Open Database License. The files in `data/` are derived from it. Map tiles by [OpenFreeMap](https://openfreemap.org) (OpenMapTiles schema), search by [Photon](https://photon.komoot.io) and [Nominatim](https://nominatim.org).
+Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available under the Open Database License. The files in `data/` are derived from it. Map tiles by [OpenFreeMap](https://openfreemap.org) (OpenMapTiles schema), search by [Photon](https://photon.komoot.io) and [Nominatim](https://nominatim.org). Ratings, when the proxy is set up, from Google Maps and Tripadvisor.

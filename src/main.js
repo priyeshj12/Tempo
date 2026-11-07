@@ -1,10 +1,10 @@
 import { decodeGraph, finalizeGraph } from './graph.js';
 import { makeProjection, projectPolygons, geojsonPolygons, ringsBounds, ringsArea, simplifyFlat, landOutline, PolygonIndex, haversine } from './geo.js';
-import { solveTogether, separateFloods, dijkstra } from './search.js';
+import { solveTogether, separateFloods, dijkstra, tracePath } from './search.js';
 import { buildTimeline } from './timeline.js';
 import { Renderer, STAGE_W, STAGE_H, FONT_SANS, FONT_MONO } from './renderer.js';
 import { lookupCity, geocode, suggest, placeName, landmarkName, overpassQuery, overpass, isLive, setOffline, stationName } from './osm.js';
-import { CATEGORIES, placesQuery, candidatesFrom, candidatesFromTiles, rankCandidates } from './places.js';
+import { CATEGORIES, placesQuery, candidatesFrom, candidatesFromTiles, rankByTrip } from './places.js';
 import { fetchTiles, decodeLayer, tileLonLat } from './tiles.js';
 import { loadBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from './offline.js';
 import { CanvasRecorder, recordingSupported } from './recorder.js';
@@ -675,6 +675,19 @@ function requestMeetName() {
 // ---------------------------------------------------------------------------
 // things to do
 
+// Chill, as Tempo means it: somewhere to spend an hour together with
+// nothing to plan.
+const CHILL_NOTE = 'Somewhere to spend an hour with nothing to plan: parks and waterfronts, viewpoints, bathhouses and spas, tea houses and easy-going bars.';
+const PLACES_API = (window.TEMPO_PLACES_API || '').replace(/\/+$/, '');
+const clampRange = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/** Each friend's full search, for trips to any place (computed once per result). */
+function friendSearches() {
+  const res = state.result;
+  if (!res.full) res.full = state.active.map((f) => dijkstra(state.graph, f.node));
+  return res.full;
+}
+
 async function loadPlaces() {
   const res = state.result;
   if (!res || res.meet < 0) return;
@@ -682,20 +695,39 @@ async function loadPlaces() {
   const [lon, lat] = meetLonLat();
   state.placesState = 'loading';
   state.places = null;
+  clearTarget();
   renderPlaces();
-  const walk = dijkstra(state.graph, res.meet).dist;
-  const show = (candidates) => {
+  const ctx = { graph: state.graph, trips: friendSearches().map((s) => s.dist), fairest: res.radius };
+  const show = (candidates, sources) => {
     if (token !== state.placesToken) return;
-    state.places = rankCandidates(candidates, { graph: state.graph, walk });
+    state.places = rankByTrip(candidates, ctx);
+    state.placeSources = sources;
     state.placesState = 'done';
     renderPlaces();
     draw();
   };
+  const osm = { eat: 'OpenStreetMap', activity: 'OpenStreetMap', sightseeing: 'OpenStreetMap', chill: 'OpenStreetMap' };
+
+  // rated places from Google and Tripadvisor, through the places proxy
+  if (PLACES_API && isLive()) {
+    try {
+      const radius = Math.round(clampRange(res.radius * 0.3, 1500, 8000));
+      const url = `${PLACES_API}/places?lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&radius=${radius}&lang=${lang}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`Places proxy answered ${r.status}`);
+      const body = await r.json();
+      show(body.places.map((p) => ({ ...p, category: p.group })), { ...osm, ...body.sources });
+      return;
+    } catch (err) {
+      console.warn('Places proxy failed, using OpenStreetMap:', err);
+    }
+  }
 
   // the preset city carries its own places
+  const wide = Math.round(clampRange(res.radius * 0.25, 1200, 3000));
   if (onPreset()) {
     try {
-      show(bundledPlacesNear(await bundle(), lat, lon, 1200, lang));
+      show(bundledPlacesNear(await bundle(), lat, lon, wide, lang), osm);
     } catch (err) {
       failPlaces(token, err);
     }
@@ -708,11 +740,11 @@ async function loadPlaces() {
   let richer = false;
   const tilesJob = placesFromTiles(lat, lon).then((c) => {
     fromTiles = c;
-    if (!richer) show(c);
+    if (!richer) show(c, osm);
   });
-  const overpassJob = overpass(placesQuery(lat, lon, 1200)).then((d) => {
+  const overpassJob = overpass(placesQuery(lat, lon, wide)).then((d) => {
     richer = true;
-    show([...candidatesFrom(d.elements || [], lang), ...fromTiles]);
+    show([...candidatesFrom(d.elements || [], lang), ...fromTiles], osm);
   });
   const outcomes = await Promise.allSettled([tilesJob, overpassJob]);
   if (outcomes.every((o) => o.status === 'rejected')) failPlaces(token, outcomes[0].reason);
@@ -727,7 +759,7 @@ function failPlaces(token, err) {
 }
 
 /** Named places from the poi layer of the z14 tiles around a point. */
-async function placesFromTiles(lat, lon, radius = 1200) {
+async function placesFromTiles(lat, lon, radius = 1500) {
   if (!isLive()) throw new Error('offline');
   const dLat = radius / 111320;
   const dLon = dLat / Math.cos((lat * Math.PI) / 180);
@@ -735,6 +767,9 @@ async function placesFromTiles(lat, lon, radius = 1200) {
   for (const t of tiles) t.layer = decodeLayer(t.bytes, 'poi', 1);
   return candidatesFromTiles(tiles, tileLonLat, lang);
 }
+
+const km1 = (v) => `${v.toFixed(1)} km`;
+const extraText = (p) => (p.extra < 0.3 ? 'No detour' : `+${p.extra.toFixed(1)} km`);
 
 function renderPlaces() {
   const box = $('todo');
@@ -744,7 +779,7 @@ function renderPlaces() {
   }
   box.hidden = false;
   const [lon, lat] = meetLonLat();
-  $('todo-map').href = `https://www.openstreetmap.org/?mlat=${lat.toFixed(5)}&mlon=${lon.toFixed(5)}#map=16/${lat.toFixed(5)}/${lon.toFixed(5)}`;
+  $('todo-map').href = `https://www.openstreetmap.org/?mlat=${lat.toFixed(5)}&mlon=${lon.toFixed(5)}#map=14/${lat.toFixed(5)}/${lon.toFixed(5)}`;
 
   const tabs = $('tabs');
   tabs.innerHTML = '';
@@ -763,29 +798,67 @@ function renderPlaces() {
     }
     tabs.appendChild(b);
   }
+  const key = $('places-key');
+  key.textContent = state.placesTab === 'chill' ? CHILL_NOTE : '';
 
   const list = $('places');
   list.innerHTML = '';
   if (state.placesState === 'loading') {
-    setNote('places-note', 'Looking for places within a short walk');
+    setNote('places-note', 'Looking for places worth the trip');
     return;
   }
   if (state.placesState === 'error') {
-    $('places-note').innerHTML = 'Could not reach the OpenStreetMap place search. <button class="link" id="places-retry">Try again</button>';
+    $('places-note').innerHTML = 'Could not load places. <button class="link" id="places-retry">Try again</button>';
     $('places-note').classList.add('error');
     return;
   }
   const items = state.places ? state.places[state.placesTab] : [];
+  const source = state.placeSources?.[state.placesTab] || 'OpenStreetMap';
   if (!items.length) {
-    setNote('places-note', 'Nothing of this kind is mapped within a short walk. The lit streets nearby may have more.');
+    setNote('places-note', 'Nothing of this kind found within reach.');
     return;
   }
-  setNote('places-note', 'Walking times from the meeting point, along the streets');
+  const credit = source === 'OpenStreetMap' ? 'From OpenStreetMap, which has no ratings.' : `Ratings from ${source === 'Google' ? 'Google Maps' : source}.`;
+  setNote('places-note', `${credit} Each friend's trip is along the streets; +km is how much longer the longest trip gets than at the fairest spot.`);
   for (const p of items) {
     const li = document.createElement('li');
-    li.innerHTML = `<a href="${p.url}" target="_blank" rel="noopener"><span class="name"></span><span class="kind"></span><span class="walk">${p.minutes} min</span></a>`;
-    li.querySelector('.name').textContent = p.name;
-    li.querySelector('.kind').textContent = p.kind;
+    const selected = state.target?.id === p.id;
+    li.className = selected ? 'selected' : '';
+    const b = document.createElement('button');
+    b.className = 'place';
+    b.dataset.id = p.id;
+    b.setAttribute('aria-pressed', String(selected));
+    b.setAttribute('aria-label', `${p.name}: show everyone's route on the map`);
+    b.innerHTML = '<span class="name"></span><span class="rating"></span><span class="kind"></span><span class="extra"></span><span class="trips"></span>';
+    b.querySelector('.name').textContent = p.name;
+    b.querySelector('.rating').textContent = p.rating != null ? `${p.rating.toFixed(1)} ★ ${p.reviews.toLocaleString('en-US')}` : '';
+    b.querySelector('.kind').textContent = p.kind || '';
+    const ex = b.querySelector('.extra');
+    ex.textContent = extraText(p);
+    ex.classList.toggle('more', p.extra >= 0.3);
+    const trips = b.querySelector('.trips');
+    state.active.forEach((f, i) => {
+      const t = document.createElement('span');
+      t.className = 'trip';
+      t.style.setProperty('--c', f.color);
+      const delta = p.km[i] - friendSearches()[i].dist[state.result.meet] / 1000;
+      t.title = `${displayName(f)}: ${km1(p.km[i])}, ${delta >= 0 ? '+' : ''}${delta.toFixed(1)} km compared with the fairest spot`;
+      t.innerHTML = '<i></i><span class="who"></span><b></b>';
+      t.querySelector('.who').textContent = displayName(f);
+      t.querySelector('b').textContent = p.km[i].toFixed(1);
+      if (p.km[i] === p.longest && p.extra >= 0.3) t.classList.add('longest');
+      trips.appendChild(t);
+    });
+    li.appendChild(b);
+    if (p.url) {
+      const a = document.createElement('a');
+      a.className = 'open';
+      a.href = p.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = p.source === 'Google' ? 'Open in Google Maps' : p.source === 'Tripadvisor' ? 'See on Tripadvisor' : 'Open map';
+      li.appendChild(a);
+    }
     list.appendChild(li);
   }
 }
@@ -810,6 +883,36 @@ $('places-note').addEventListener('click', (e) => {
   if (e.target.id === 'places-retry') loadPlaces();
 });
 
+// choosing a place shows everyone's route to it
+$('places').addEventListener('click', (e) => {
+  const b = e.target.closest('.place');
+  if (!b) return;
+  const p = Object.values(state.places || {}).flat().find((x) => x.id === b.dataset.id);
+  if (!p) return;
+  if (state.target?.id === p.id) clearTarget();
+  else setTarget(p);
+  renderPlaces();
+  draw();
+});
+
+function setTarget(p) {
+  const searches = friendSearches();
+  state.target = p;
+  renderer.setTarget({
+    ...p,
+    paths: searches.map((s) => tracePath(state.graph, s.pred, p.node)),
+  });
+  // show the finished picture with the routes
+  pause();
+  state.editing = false;
+  if (state.timeline) state.t = state.timeline.duration;
+}
+
+function clearTarget() {
+  state.target = null;
+  renderer.setTarget(null);
+}
+
 // ---------------------------------------------------------------------------
 // playback
 
@@ -819,7 +922,11 @@ function picks() {
   if (!state.places) return [];
   return CATEGORIES.map((c) => ({ label: c.label, top: state.places[c.id][0] }))
     .filter((p) => p.top)
-    .map((p) => ({ label: p.label, name: p.top.name, minutes: p.top.minutes }));
+    .map(({ label, top }) => ({
+      label,
+      name: top.name,
+      detail: top.rating != null ? `★ ${top.rating.toFixed(1)}  ${extraText(top)}` : extraText(top),
+    }));
 }
 
 function draw() {

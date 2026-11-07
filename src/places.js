@@ -272,6 +272,72 @@ export function rankPlaces(elements, opts) {
   return rankCandidates(candidatesFrom(elements, opts.lang), opts);
 }
 
+// How many stars one extra kilometre on the longest trip costs a place.
+export const STARS_PER_EXTRA_KM = 0.15;
+
+/**
+ * How good a place is, on a star scale. Rated places use their rating,
+ * pulled towards an average when few people rated them, plus a little for
+ * being popular. OpenStreetMap places have no ratings, so being well known
+ * (a Wikipedia or Wikidata link) and, for parks, size stand in.
+ */
+export function quality(p) {
+  if (p.rating != null && p.reviews > 0) {
+    const prior = 4.1;
+    const weight = 25;
+    const bayes = (p.rating * p.reviews + prior * weight) / (p.reviews + weight);
+    return bayes + 0.12 * Math.log10(1 + p.reviews);
+  }
+  let q = 4.0;
+  if (p.notable) q += 0.45;
+  if (p.details) q += 0.05;
+  if (p.park && p.area > 2000) q += Math.min(2, Math.log10(p.area / 2000)) * 0.2;
+  return q;
+}
+
+/**
+ * Ranks places for a group of friends: better places may be further away,
+ * as long as they are worth the extra distance for whoever travels furthest.
+ *
+ * @param {Array} candidates  places with category, lat, lon and rating data
+ * @param {object} ctx
+ * @param {object} ctx.graph         road graph
+ * @param {Float64Array[]} ctx.trips one array per friend: metres to every node
+ * @param {number} ctx.fairest       longest trip to the fairest spot, metres
+ * @returns {object} group -> [{...place, km: [per friend], longest, extra, fun, score}]
+ */
+export function rankByTrip(candidates, { graph, trips, fairest, limit = 6 }) {
+  const groups = Object.fromEntries(CATEGORIES.map((c) => [c.id, []]));
+  const maxExtra = Math.max(2, (0.4 * fairest) / 1000);
+  for (const p of candidates) {
+    if (!groups[p.category]) continue;
+    const [x, y] = graph.proj.fwd(p.lon, p.lat);
+    const node = graph.grid.nearest(x, y);
+    const toRoad = Math.hypot(graph.nodeX[node] - x, graph.nodeY[node] - y);
+    if (toRoad > 800) continue;
+    const km = trips.map((d) => (d[node] + toRoad) / 1000);
+    if (km.some((v) => !Number.isFinite(v))) continue;
+    const longest = Math.max(...km);
+    const extra = longest - fairest / 1000;
+    if (extra > maxExtra) continue;
+    const fun = quality(p);
+    groups[p.category].push({ ...p, node, km, longest, extra, fun, score: fun - STARS_PER_EXTRA_KM * Math.max(0, extra) });
+  }
+  for (const c of CATEGORIES) {
+    const out = [];
+    const names = new Set();
+    for (const p of groups[c.id].sort((a, b) => b.score - a.score)) {
+      const key = p.name.toLowerCase();
+      if (names.has(key)) continue;
+      names.add(key);
+      out.push(p);
+      if (out.length >= limit) break;
+    }
+    groups[c.id] = out;
+  }
+  return groups;
+}
+
 /** Ranks place candidates into the four groups by walking distance. */
 export function rankCandidates(candidates, { graph, walk, limit = 5 }) {
   const groups = Object.fromEntries(CATEGORIES.map((c) => [c.id, []]));

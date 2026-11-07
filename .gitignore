@@ -2,3 +2,7 @@ node_modules/
 build/
 *.pbf
 .DS_Store
+
+# worker secrets for local development
+worker/.dev.vars
+.wrangler/

@@ -17,6 +17,7 @@ const css = readFileSync(join(root, 'styles.css'), 'utf8');
 
 const body = html
   .slice(html.indexOf('<body>') + '<body>'.length, html.indexOf('</body>'))
+  .replace(/\s*<script src="config\.js"><\/script>\s*/, '\n')
   .replace(/\s*<script type="module" src="src\/main\.js"><\/script>\s*/, '\n')
   .trim();
 const fonts = html.match(/<link rel="stylesheet" href="(https:\/\/fonts\.googleapis\.com[^"]+)">/)[1];
