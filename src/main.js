@@ -3,8 +3,9 @@ import { makeProjection, projectPolygons, geojsonPolygons, ringsBounds, ringsAre
 import { solveTogether, separateFloods, dijkstra } from './search.js';
 import { buildTimeline } from './timeline.js';
 import { Renderer, STAGE_W, STAGE_H, FONT_SANS, FONT_MONO } from './renderer.js';
-import { searchCities, lookupCity, geocode, placeName, landmarkName, overpassQuery, overpass, isLive, setOffline, stationName } from './osm.js';
-import { CATEGORIES, placesQuery, candidatesFrom, rankCandidates } from './places.js';
+import { lookupCity, geocode, suggest, placeName, landmarkName, overpassQuery, overpass, isLive, setOffline, stationName } from './osm.js';
+import { CATEGORIES, placesQuery, candidatesFrom, candidatesFromTiles, rankCandidates } from './places.js';
+import { fetchTiles, decodeLayer, tileLonLat } from './tiles.js';
 import { loadBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from './offline.js';
 import { CanvasRecorder, recordingSupported } from './recorder.js';
 import { dataPath, fetchBytes } from './files.js';
@@ -157,7 +158,10 @@ function buildInWorker(payload, onProgress) {
   });
 }
 
-/** Downloads the streets of a place (a city boundary or a box) and builds the graph. */
+/**
+ * Loads the streets of a place and builds the graph: from map tiles, which
+ * arrive in seconds, falling back to an Overpass extract if they fail.
+ */
 async function loadArea(place) {
   const polys = geojsonPolygons(place.geojson);
   const [s, n, w, e] = place.bbox;
@@ -170,13 +174,21 @@ async function loadArea(place) {
     throw new Error(`That area is about ${Math.round(km2).toLocaleString('en-US')} km², too large to load. Tempo works within one city or region.`);
   }
 
-  const label = { all: 'all streets', main: 'main roads', major: 'major roads' }[detail];
-  setStatus(`Downloading ${label} around ${place.label}`);
-  const graph = await buildInWorker({ query: overpassQuery(place, detail), polygons: polys, lon0, lat0 }, (msg) => {
-    if (msg.stage === 'download') setStatus(`Downloading ${label} around ${place.label}, ${(msg.bytes / 1e6).toFixed(1)} MB`);
+  const progress = (msg) => {
+    if (msg.stage === 'tiles') setStatus(`Loading the map around ${place.label}, ${msg.done} of ${msg.total} tiles`);
+    else if (msg.stage === 'connect') setStatus('Connecting the streets');
+    else if (msg.stage === 'download') setStatus(`Downloading streets around ${place.label}, ${(msg.bytes / 1e6).toFixed(1)} MB`);
     else if (msg.stage === 'parse') setStatus('Reading the street data');
     else setStatus(`Building the street network, ${Math.round(msg.fraction * 100)}%`);
-  });
+  };
+  setStatus(`Loading the map around ${place.label}`);
+  let graph;
+  try {
+    graph = await buildInWorker({ box: [w, s, e, n], polygons: polys, lon0, lat0 }, progress);
+  } catch (err) {
+    console.warn('Map tiles failed, asking Overpass instead:', err);
+    graph = await buildInWorker({ query: overpassQuery(place, detail), polygons: polys, lon0, lat0 }, progress);
+  }
 
   // follow the shore rather than a boundary out at sea
   let outline = [];
@@ -251,24 +263,8 @@ async function ensureArea(friends) {
     return;
   }
   if (!isLive()) throw new Error('Only Tokyo\u2019s 23 wards can be loaded right now, so every starting point needs to be there.');
-  // everyone in the same city: use its boundary when it is small enough for every street
+  // the streets in a box around everyone: small, and quick to load from tiles
   const city = mostCommon(friends.map((f) => f.city));
-  if (city && friends.every((f) => f.city === city)) {
-    setStatus(`Looking up ${city}`);
-    const country = mostCommon(friends.map((f) => f.country));
-    const found = await searchCities([city, country].filter(Boolean).join(', ')).catch(() => []);
-    for (const c of found) {
-      const [s, n, w, e] = c.bbox;
-      const proj = makeProjection((w + e) / 2, (s + n) / 2);
-      const polys = geojsonPolygons(c.geojson);
-      const km2 = polygonsAreaKm2(polys, proj);
-      const index = new PolygonIndex(projectPolygons(polys, proj));
-      if (km2 <= 600 && friends.every((f) => index.contains(...proj.fwd(f.lon, f.lat)))) {
-        await loadArea(cityPlace(c));
-        return;
-      }
-    }
-  }
   let name = city || mostCommon(friends.map((f) => f.region));
   if (!name) {
     // links shared before carry no city; name the area from its middle
@@ -408,9 +404,37 @@ function searchBias() {
   return [Math.min(...lons) - 0.2, Math.min(...lats) - 0.2, Math.max(...lons) + 0.2, Math.max(...lats) + 0.2];
 }
 
-async function lookupFriend(f, { quiet = false } = {}) {
+/** Where the other friends are, to rank suggestions near them first. */
+function friendsCentre(except) {
+  const others = state.friends.filter((f) => f !== except && located(f));
+  if (!others.length) return null;
+  return [others.reduce((a, f) => a + f.lat, 0) / others.length, others.reduce((a, f) => a + f.lon, 0) / others.length];
+}
+
+/** Matches for what was typed: Photon as you type, the bundled list offline. */
+async function suggestFor(q, f, signal) {
+  if (isLive()) {
+    try {
+      return await suggest(q, { near: friendsCentre(f), signal });
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      console.warn('Suggestions failed:', err);
+    }
+  }
+  return searchGazetteer(await bundle(), q, 6);
+}
+
+const near = (a, b, metres) =>
+  Math.hypot((a.lat - b.lat) * 111320, (a.lon - b.lon) * 111320 * Math.cos((a.lat * Math.PI) / 180)) < metres;
+
+/**
+ * Turns typed text into a place without guessing: one clear match is used,
+ * several matches ask the person to choose.
+ */
+async function resolveFriend(f, { quiet = false } = {}) {
   const q = f.query.trim();
   const token = ++f.token;
+  closeSuggestions(f);
   if (!q) {
     Object.assign(f, { status: 'empty', lat: null, lon: null, node: null, place: '', detail: '', alts: [] });
     renderFriends();
@@ -419,13 +443,16 @@ async function lookupFriend(f, { quiet = false } = {}) {
   f.status = 'pending';
   renderFriends();
   try {
-    const results = await findPlace(q, searchBias());
+    let results = await suggestFor(q, f);
+    if (!results.length) results = await findPlace(q, searchBias());
     if (token !== f.token) return;
     if (!results.length) {
       Object.assign(f, { status: 'missing', alts: [] });
-    } else {
+    } else if (results.every((r) => near(r, results[0], 300))) {
       useResult(f, results[0]);
-      f.alts = results.slice(1);
+      f.alts = [];
+    } else {
+      Object.assign(f, { status: 'choose', alts: results, lat: null, lon: null, node: null });
     }
   } catch (err) {
     if (token !== f.token) return;
@@ -434,7 +461,89 @@ async function lookupFriend(f, { quiet = false } = {}) {
   }
   renderFriends();
   showCoverage();
-  if (!quiet) afterMove(f);
+  if (!quiet && f.status === 'found') afterMove(f);
+}
+
+function pick(f, r) {
+  f.token++;
+  f.query = r.label;
+  useResult(f, r);
+  f.alts = [];
+  closeSuggestions(f);
+  renderFriends();
+  // the field keeps its focus, so set what it shows here
+  const input = rowOf(f)?.querySelector('.where');
+  if (input) input.value = f.query;
+  afterMove(f);
+}
+
+// ---------------------------------------------------------------------------
+// suggestions while typing
+
+function rowOf(f) {
+  return $('friends').children[state.friends.indexOf(f)];
+}
+
+function closeSuggestions(f) {
+  clearTimeout(f.suggestTimer);
+  f.suggestAbort?.abort();
+  f.suggestions = [];
+  f.active = -1;
+  const li = rowOf(f);
+  if (li) renderSuggestions(li, f);
+}
+
+function scheduleSuggestions(f) {
+  clearTimeout(f.suggestTimer);
+  if (f.query.trim().length < 3) {
+    closeSuggestions(f);
+    return;
+  }
+  f.suggestTimer = setTimeout(() => loadSuggestions(f), isLive() ? 250 : 60);
+}
+
+async function loadSuggestions(f) {
+  const q = f.query.trim();
+  f.suggestAbort?.abort();
+  const ctl = new AbortController();
+  f.suggestAbort = ctl;
+  try {
+    const results = await suggestFor(q, f, ctl.signal);
+    if (ctl.signal.aborted || f.query.trim() !== q || f.status === 'found') return;
+    f.suggestions = results;
+    f.active = results.length ? 0 : -1;
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    f.suggestions = [];
+  }
+  const li = rowOf(f);
+  if (li && document.activeElement === li.querySelector('.where')) renderSuggestions(li, f);
+}
+
+function renderSuggestions(li, f) {
+  const ul = li.querySelector('.suggest');
+  const input = li.querySelector('.where');
+  const list = f.suggestions || [];
+  ul.innerHTML = '';
+  list.forEach((r, k) => {
+    const item = document.createElement('li');
+    item.id = `${ul.id}-${k}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(k === f.active));
+    item.dataset.k = k;
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = r.label;
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    sub.textContent = r.sub ?? r.detail;
+    item.append(label, sub);
+    ul.appendChild(item);
+  });
+  ul.hidden = !list.length;
+  input.setAttribute('aria-expanded', String(!!list.length));
+  if (f.active >= 0 && list.length) input.setAttribute('aria-activedescendant', `${ul.id}-${f.active}`);
+  else input.removeAttribute('aria-activedescendant');
 }
 
 function useResult(f, r) {
@@ -574,22 +683,57 @@ async function loadPlaces() {
   state.placesState = 'loading';
   state.places = null;
   renderPlaces();
-  try {
-    // the preset city carries its own places; elsewhere ask Overpass
-    const candidates = onPreset()
-      ? bundledPlacesNear(await bundle(), lat, lon, 1200, lang)
-      : candidatesFrom((await overpass(placesQuery(lat, lon, 1200))).elements || [], lang);
+  const walk = dijkstra(state.graph, res.meet).dist;
+  const show = (candidates) => {
     if (token !== state.placesToken) return;
-    const walk = dijkstra(state.graph, res.meet).dist;
     state.places = rankCandidates(candidates, { graph: state.graph, walk });
     state.placesState = 'done';
-  } catch (err) {
-    if (token !== state.placesToken) return;
-    console.warn('Could not load places:', err);
-    state.placesState = 'error';
+    renderPlaces();
+    draw();
+  };
+
+  // the preset city carries its own places
+  if (onPreset()) {
+    try {
+      show(bundledPlacesNear(await bundle(), lat, lon, 1200, lang));
+    } catch (err) {
+      failPlaces(token, err);
+    }
+    return;
   }
+
+  // elsewhere: the map tiles' places at once, then Overpass's richer ones
+  // (cuisines, landmarks) merged in if they arrive
+  let fromTiles = [];
+  let richer = false;
+  const tilesJob = placesFromTiles(lat, lon).then((c) => {
+    fromTiles = c;
+    if (!richer) show(c);
+  });
+  const overpassJob = overpass(placesQuery(lat, lon, 1200)).then((d) => {
+    richer = true;
+    show([...candidatesFrom(d.elements || [], lang), ...fromTiles]);
+  });
+  const outcomes = await Promise.allSettled([tilesJob, overpassJob]);
+  if (outcomes.every((o) => o.status === 'rejected')) failPlaces(token, outcomes[0].reason);
+}
+
+function failPlaces(token, err) {
+  if (token !== state.placesToken) return;
+  console.warn('Could not load places:', err);
+  state.placesState = 'error';
   renderPlaces();
   draw();
+}
+
+/** Named places from the poi layer of the z14 tiles around a point. */
+async function placesFromTiles(lat, lon, radius = 1200) {
+  if (!isLive()) throw new Error('offline');
+  const dLat = radius / 111320;
+  const dLon = dLat / Math.cos((lat * Math.PI) / 180);
+  const tiles = await fetchTiles([lon - dLon, lat - dLat, lon + dLon, lat + dLat], 14);
+  for (const t of tiles) t.layer = decodeLayer(t.bytes, 'poi', 1);
+  return candidatesFromTiles(tiles, tileLonLat, lang);
 }
 
 function renderPlaces() {
@@ -759,10 +903,11 @@ function renderFriends() {
       li.innerHTML = `
         <button class="line-chip"></button>
         <input class="name" type="text" placeholder="Name" maxlength="18" autocomplete="off">
-        <input class="where" type="text" placeholder="Starting point" maxlength="80" autocomplete="off" enterkeyhint="search">
+        <input class="where" type="text" placeholder="Starting point" maxlength="80" autocomplete="off" enterkeyhint="search" role="combobox" aria-autocomplete="list" aria-expanded="false">
         <button class="icon remove">${ICONS.remove}</button>
         <p class="status"></p>
-        <ul class="alts" hidden></ul>`;
+        <ul class="alts" hidden></ul>
+        <ul class="suggest" role="listbox" hidden></ul>`;
       list.appendChild(li);
     });
   }
@@ -783,6 +928,10 @@ function renderFriends() {
     if (document.activeElement !== nameInput && nameInput.value !== f.name) nameInput.value = f.name;
     const where = li.querySelector('.where');
     where.setAttribute('aria-label', `${name}'s starting point`);
+    const suggestList = li.querySelector('.suggest');
+    suggestList.id = `suggest-${i}`;
+    suggestList.setAttribute('aria-label', `Places matching ${name}'s starting point`);
+    where.setAttribute('aria-controls', suggestList.id);
     if (document.activeElement !== where && where.value !== f.query) where.value = f.query;
     const remove = li.querySelector('.remove');
     remove.setAttribute('aria-label', `Remove ${name}`);
@@ -801,7 +950,9 @@ function renderFriends() {
           : 'Not found. Try a station or neighbourhood in Tokyo.';
     else if (f.status === 'error') text.textContent = 'The place search is not answering. Try again in a moment.';
     else if (f.status === 'found') text.textContent = f.detail && f.detail !== f.query ? f.detail : '';
-    else text.textContent = 'Neighbourhood, station or address';
+    else if (f.status === 'choose') text.textContent = `${f.alts.length} places match. Choose one`;
+    else if (f.status === 'typing') text.textContent = 'Choose a match from the list';
+    else text.textContent = 'Street, station or place';
     status.appendChild(text);
     if (f.status === 'found' && f.alts.length) {
       const alt = document.createElement('button');
@@ -809,6 +960,31 @@ function renderFriends() {
       alt.textContent = 'Not this one';
       status.appendChild(alt);
     }
+    li.classList.toggle('choosing', f.status === 'choose');
+    const alts = li.querySelector('.alts');
+    if (f.status === 'choose') {
+      alts.innerHTML = '';
+      f.alts.forEach((r, k) => {
+        const item = document.createElement('li');
+        const b = document.createElement('button');
+        b.dataset.k = k;
+        b.className = 'choice';
+        const label = document.createElement('span');
+        label.className = 'label';
+        label.textContent = r.label;
+        const sub = document.createElement('span');
+        sub.className = 'sub';
+        sub.textContent = r.sub ?? r.detail;
+        b.append(label, sub);
+        item.appendChild(b);
+        alts.appendChild(item);
+      });
+      alts.hidden = false;
+    } else if (alts.querySelector('.choice')) {
+      alts.hidden = true;
+      alts.innerHTML = '';
+    }
+    renderSuggestions(li, f);
   });
   $('add-friend').disabled = state.friends.length >= MAX_FRIENDS;
   $('friend-count').textContent = `${state.friends.length} of ${MAX_FRIENDS}`;
@@ -917,8 +1093,14 @@ async function findMeeting() {
   if (state.loading) return;
   pause();
   setNote('find-note', '');
-  const pending = state.friends.filter((f) => f.query.trim() && f.status !== 'found');
-  for (const f of pending) await lookupFriend(f, { quiet: true });
+  const pending = state.friends.filter((f) => f.query.trim() && f.status !== 'found' && f.status !== 'choose');
+  for (const f of pending) await resolveFriend(f, { quiet: true });
+  const unsure = state.friends.filter((f) => f.status === 'choose');
+  if (unsure.length) {
+    setNote('find-note', `Choose which place you mean for ${unsure.map(displayName).join(', ')}`, true);
+    rowOf(unsure[0])?.querySelector('.choice')?.focus();
+    return;
+  }
   const ready = state.friends.filter(located);
   if (ready.length < MIN_FRIENDS) {
     setNote('find-note', 'Add at least two starting points that can be found on the map', true);
@@ -1051,6 +1233,23 @@ $('friends').addEventListener('click', (e) => {
   if (e.target.closest('.remove')) return removeFriend(i);
   if (e.target.closest('.line-chip')) return selectFriend(i);
   if (e.target.closest('.alt-toggle')) return toggleAlts(li, f);
+  const choice = e.target.closest('.choice');
+  if (choice) return pick(f, f.alts[+choice.dataset.k]);
+});
+
+// a suggestion is picked on mousedown, before the field loses focus
+$('friends').addEventListener('mousedown', (e) => {
+  const option = e.target.closest('.suggest [role="option"]');
+  if (!option) return;
+  e.preventDefault();
+  const f = state.friends[+e.target.closest('.friend').dataset.i];
+  pick(f, f.suggestions[+option.dataset.k]);
+});
+
+$('friends').addEventListener('focusout', (e) => {
+  if (!e.target.classList.contains('where')) return;
+  const f = state.friends[+e.target.closest('.friend').dataset.i];
+  if (f) closeSuggestions(f);
 });
 
 $('friends').addEventListener('input', (e) => {
@@ -1065,18 +1264,46 @@ $('friends').addEventListener('input', (e) => {
     writeHash();
   } else if (e.target.classList.contains('where')) {
     f.query = e.target.value;
+    f.token++; // whatever was being looked up is out of date
+    const typed = f.query.trim() ? 'typing' : 'empty';
+    if (f.status !== typed) {
+      Object.assign(f, { status: typed, lat: null, lon: null, node: null, alts: [] });
+      renderFriends();
+    }
+    scheduleSuggestions(f);
   }
 });
 
-// a changed starting point is looked up when the field is left or Enter is pressed
+// text left without choosing from the list is looked up when the field is left
 $('friends').addEventListener('change', (e) => {
   if (!e.target.classList.contains('where')) return;
   const f = state.friends[+e.target.closest('.friend').dataset.i];
-  lookupFriend(f);
+  if (f.status === 'found' && e.target.value === f.query) return;
+  resolveFriend(f);
 });
 
 $('friends').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && e.target.classList.contains('where')) e.target.blur();
+  if (!e.target.classList.contains('where')) return;
+  const li = e.target.closest('.friend');
+  const f = state.friends[+li.dataset.i];
+  const open = f.suggestions && f.suggestions.length;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!open) {
+      if (f.query.trim().length >= 3) loadSuggestions(f);
+      return;
+    }
+    e.preventDefault();
+    const n = f.suggestions.length;
+    f.active = (f.active + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+    renderSuggestions(li, f);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (open && f.active >= 0) pick(f, f.suggestions[f.active]);
+    else e.target.blur();
+  } else if (e.key === 'Escape' && open) {
+    e.preventDefault();
+    closeSuggestions(f);
+  }
 });
 
 $('add-friend').addEventListener('click', addFriend);

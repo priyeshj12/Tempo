@@ -388,6 +388,62 @@ input[type="text"]:focus-visible { outline-offset: 0; }
 .icon:disabled { opacity: 0.3; cursor: default; background: none; }
 .icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 
+/* suggestions while typing, over the rows below */
+.friend { position: relative; }
+
+.suggest {
+  position: absolute;
+  z-index: 20;
+  top: 40px;
+  left: 32px;
+  right: 40px;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--raised);
+  border: 1px solid var(--hair-strong);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.suggest li,
+.alts .choice {
+  display: grid;
+  gap: 0;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.suggest li[aria-selected="true"],
+.suggest li:hover,
+.alts .choice:hover,
+.alts .choice:focus-visible { background: var(--card); }
+
+.suggest .label,
+.alts .choice .label {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.suggest .sub,
+.alts .choice .sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-3);
+}
+
+.friend.choosing .status { color: var(--text-1); }
+
 .alts {
   grid-column: 2 / 4;
   list-style: none;

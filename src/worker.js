@@ -1,21 +1,34 @@
-// Downloads a city's roads from Overpass and builds the graph off the main thread.
+// Builds the street graph of an area off the main thread: from vector map
+// tiles (fast, cached on a CDN), or from an Overpass query as a fallback.
 
 import { buildGraph, graphTransfer } from './graph.js';
 import { makeProjection, PolygonIndex, projectPolygons } from './geo.js';
 import { OVERPASS_ENDPOINTS } from './osm.js';
+import { chooseZoom, fetchTiles, decodeLayer, connectTiles, toElements } from './tiles.js';
 
 self.onmessage = async (ev) => {
-  const { id, query, polygons, lon0, lat0 } = ev.data;
+  const { id, query, box, polygons, lon0, lat0 } = ev.data;
   const post = (msg, transfer) => self.postMessage({ id, ...msg }, transfer || []);
   try {
-    const text = await fetchOverpass(query, (bytes) => post({ type: 'progress', stage: 'download', bytes }));
-    post({ type: 'progress', stage: 'parse' });
-    const data = JSON.parse(text);
-    if (data.remark && /error/i.test(data.remark)) throw new Error(`Overpass: ${data.remark}`);
-    const elements = data.elements || [];
+    const proj = makeProjection(lon0, lat0);
+    let elements;
+    if (box) {
+      const z = chooseZoom(box);
+      const tiles = await fetchTiles(box, z, {
+        onProgress: (done, total) => post({ type: 'progress', stage: 'tiles', done, total }),
+      });
+      post({ type: 'progress', stage: 'connect' });
+      for (const t of tiles) t.layer = decodeLayer(t.bytes, 'transportation');
+      elements = toElements(connectTiles(tiles, proj), proj);
+    } else {
+      const text = await fetchOverpass(query, (bytes) => post({ type: 'progress', stage: 'download', bytes }));
+      post({ type: 'progress', stage: 'parse' });
+      const data = JSON.parse(text);
+      if (data.remark && /error/i.test(data.remark)) throw new Error(`Overpass: ${data.remark}`);
+      elements = data.elements || [];
+    }
     if (!elements.length) throw new Error('No roads found in this area.');
 
-    const proj = makeProjection(lon0, lat0);
     const clip = new PolygonIndex(projectPolygons(polygons, proj));
     const g = buildGraph(elements, {
       proj,

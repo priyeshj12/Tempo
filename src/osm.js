@@ -220,6 +220,67 @@ export async function overpass(query, { signal } = {}) {
   throw lastError || new Error('Overpass is unreachable');
 }
 
+// Photon (by Komoot) is an OpenStreetMap geocoder made for search as you
+// type, which Nominatim's usage policy does not allow.
+const PHOTON = 'https://photon.komoot.io/api/';
+const PHOTON_LANGS = ['en', 'de', 'fr', 'it'];
+const suggestCache = new Map();
+
+/**
+ * Address and place suggestions while typing. `near` ([lat, lon]) ranks
+ * nearby matches first without hiding the rest.
+ */
+export async function suggest(q, { near = null, signal } = {}) {
+  if (!live) throw new Error('offline');
+  const lang = (navigator.language || 'en').slice(0, 2);
+  const params = new URLSearchParams({ q, limit: '10', lang: PHOTON_LANGS.includes(lang) ? lang : 'default' });
+  if (near) {
+    params.set('lat', near[0].toFixed(3));
+    params.set('lon', near[1].toFixed(3));
+  }
+  const url = `${PHOTON}?${params}`;
+  if (!suggestCache.has(url)) {
+    const p = fetch(url, { signal }).then((res) => {
+      if (!res.ok) throw new Error(`Photon ${res.status}`);
+      return res.json();
+    });
+    p.catch(() => suggestCache.delete(url));
+    suggestCache.set(url, p);
+  }
+  const data = await suggestCache.get(url);
+  const out = [];
+  for (const f of data.features || []) {
+    const r = photonResult(f);
+    if (!r.label) continue;
+    // one street is often mapped as several pieces: keep the first
+    if (out.some((o) => o.label === r.label && o.city === r.city && Math.hypot(o.lat - r.lat, (o.lon - r.lon) * Math.cos((r.lat * Math.PI) / 180)) < 0.02)) continue;
+    out.push(r);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function photonResult(f) {
+  const p = f.properties || {};
+  const [lon, lat] = f.geometry.coordinates;
+  const city = p.city || p.town || p.village || p.locality || p.district || p.county || '';
+  const street = p.street ? `${p.street}${p.housenumber ? ` ${p.housenumber}` : ''}` : '';
+  let label = p.name || street || city;
+  if (!p.name && p.housenumber && p.street) label = street;
+  const parts = [p.name && street ? street : '', [p.postcode, city].filter(Boolean).join(' '), p.state, p.country];
+  const detail = parts.filter((x, i) => x && x !== label && parts.indexOf(x) === i).join(', ');
+  return {
+    label,
+    detail: detail ? `${label}, ${detail}` : label,
+    sub: detail,
+    lat,
+    lon,
+    city,
+    region: p.state || '',
+    country: p.country || '',
+  };
+}
+
 /**
  * Finds a starting point by name. Results near `near` ([lon, lat] bounds)
  * come first, but places elsewhere are still found.

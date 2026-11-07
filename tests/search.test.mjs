@@ -7,6 +7,7 @@ import { buildGraph } from '../src/graph.js';
 import { makeProjection, PolygonIndex, simplifyFlat, landOutline, ringsArea } from '../src/geo.js';
 import { classify, rankPlaces } from '../src/places.js';
 import { makeBundle, searchGazetteer, bundledPlaceName, bundledLandmark, bundledPlacesNear } from '../src/offline.js';
+import { connectTiles, toElements, tileLonLat } from '../src/tiles.js';
 
 // deterministic PRNG
 function rng(seed) {
@@ -269,6 +270,43 @@ test('offline search finds stations, spelling variants and nearby names', () => 
     ['node/2', 'eat', 'Ramen', 'ラーメン'],
   ]);
   assert.equal(near[0].notable && near[0].park, true);
+});
+
+test('streets from map tiles are joined at junctions and seams, not at bridges', () => {
+  const z = 14, x = 8414, y = 5384; // central Amsterdam
+  const [lon0, lat0] = tileLonLat(x + 1, y + 0.5, z);
+  const proj = makeProjection(lon0, lat0);
+  const road = (pts, props = {}) => ({ props: { class: 'minor', ...props }, lines: [pts] });
+  const tiles = [
+    {
+      z, x, y,
+      layer: {
+        extent: 4096,
+        features: [
+          road([100, 2000, 4150, 2000]), // A: runs past the tile edge, junction points simplified away
+          road([2000, 100, 2000, 1999.4]), // B: ends just short of A (a T-junction)
+          road([3000, 1000, 3000, 3000]), // C: crosses A at street level
+          road([1000, 1000, 1000, 3000], { brunnel: 'bridge' }), // D: a bridge over A
+        ],
+      },
+    },
+    { z, x: x + 1, y, layer: { extent: 4096, features: [road([-60, 2000, 2000, 2000])] } }, // A continues
+  ];
+  const g = buildGraph(toElements(connectTiles(tiles, proj), proj), { proj });
+  const at = (tx, px, py) => proj.fwd(...tileLonLat(tx + px / 4096, y + py / 4096, z));
+  const node = (p) => g.grid.nearest(...p);
+  const metresPerPx = Math.hypot(...[0, 1].map((k) => at(x, 4096, 0)[k] - at(x, 0, 0)[k])) / 4096;
+
+  // B to C goes along A: 1900 + 1000 + 1000 px
+  const bc = dijkstra(g, node(at(x, 2000, 100))).dist[node(at(x, 3000, 3000))];
+  assert.ok(Math.abs(bc / metresPerPx - 3900) < 40, `B to C ${bc / metresPerPx} px`);
+  // A carries on across the seam into the next tile
+  const across = dijkstra(g, node(at(x, 100, 2000))).dist[node(at(x + 1, 2000, 2000))];
+  assert.ok(Math.abs(across / metresPerPx - 5996) < 40, `across the seam ${across / metresPerPx} px`);
+  // the bridge does not join A, so it is a separate piece and left out
+  const d = at(x, 1000, 1000);
+  const n = node(d);
+  assert.ok(Math.hypot(g.nodeX[n] - d[0], g.nodeY[n] - d[1]) > 300);
 });
 
 const tokyo = new URL('../data/tokyo.tmpo', import.meta.url);

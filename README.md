@@ -9,12 +9,12 @@
 
 ## How it works
 
-1. **Starting points.** Type a neighbourhood, station or address for each friend, 2 to 12 of them. Places are found with Nominatim; if the first match is wrong, "Not this one" offers the others.
-2. **The area.** If everyone is inside a bundled city (Tokyo's 23 wards), its streets load at once. If everyone is in the same city, its boundary is used. Otherwise Tempo downloads the streets in a box around everyone from the Overpass API, with more or less detail depending on the size.
+1. **Starting points.** Type a street, station, address or place for each friend, 2 to 12 of them. Matches appear as you type (from [Photon](https://photon.komoot.io), an OpenStreetMap geocoder made for this) and you pick the right one, so a street that exists in several towns is never guessed. Text left without a pick is used only when it has one clear match; otherwise the row lists the matches to choose from.
+2. **The area.** If everyone is inside a bundled city (Tokyo's 23 wards), its streets load at once. Otherwise Tempo loads the streets in a box around everyone from [OpenFreeMap](https://openfreemap.org)'s vector map tiles, which come from a CDN in a few seconds, at more or less detail depending on how far apart everyone is. Tiles simplify roads and cut them at tile edges, so the junctions are rebuilt: line ends that meet are joined, ends touching a road are snapped onto it, and roads crossing at street level are split, but bridges and tunnels are not. The Overpass API is the fallback if the tiles cannot be loaded.
 3. **One by one.** A full Dijkstra search from each friend. Without knowing where everyone will end up, each search has to cover the whole map.
 4. **All at once.** The searches take turns, always growing whichever front is closest. The first junction every flood reaches is where the longest trip is as short as possible, so the search stops there. In the Tokyo example that checks 64% fewer roads.
 5. **Where to meet.** The searches carry on a little further to light up every street where nobody travels more than about 6% further (250 m to 1.5 km), so you can pick any spot in that zone. The centre is named after the closest station or park.
-6. **Things to do.** Named places within a short walk come from OpenStreetMap in four groups: Eat, Activity, Sightseeing and Chill. They are ranked by walking distance along the streets, with a nudge towards well known places and bigger parks, and the top pick of each group appears in the video.
+6. **Things to do.** Named places within a short walk, in four groups: Eat, Activity, Sightseeing and Chill. They show at once from the map tiles, then the Overpass API's richer details (cuisines, well known places) are merged in when they arrive. They are ranked by walking distance along the streets, with a nudge towards well known places and bigger parks, and the top pick of each group appears in the video.
 
 ## Using it
 
@@ -32,7 +32,7 @@ npm start          # serves on http://localhost:8000 (or: python3 -m http.server
 npm test           # unit tests (Node 20+)
 ```
 
-Any static host works. Finding places and loading areas other than Tokyo needs the browser to reach `nominatim.openstreetmap.org` and the Overpass API.
+Any static host works. Outside Tokyo the browser needs to reach `photon.komoot.io`, `tiles.openfreemap.org`, `nominatim.openstreetmap.org` and the Overpass API.
 
 ## Putting it on the web (GitHub Pages)
 
@@ -49,13 +49,15 @@ Then run the workflow from the Actions tab (Deploy to GitHub Pages > Run workflo
 | --- | --- |
 | `src/main.js` | App state, starting points, choosing the area, results, sharing and recording |
 | `src/search.js` | Dijkstra, the simultaneous multi-source search with its meeting zone, and `Flood` replay data |
-| `src/places.js` | The Overpass query for places, their four groups and ranking by walking distance |
+| `src/places.js` | Places from Overpass or map tiles, their four groups and ranking by walking distance |
+| `src/tiles.js` | Vector tile reader and junction rebuilding for streets from OpenFreeMap |
+| `src/offline.js` | The bundled Tokyo places and search, used when live services cannot be reached |
 | `src/graph.js` | Builds an intersection-to-intersection road graph from OSM ways, binary format, nearest-node grid |
 | `src/renderer.js` | Canvas rendering: streets, floods, wavefronts, line-coloured routes, the meeting point and captions |
 | `src/timeline.js` | The sequence of phases and what each frame shows |
 | `src/geo.js` | Projection, simplification, point-in-polygon index, shore-hugging outline tracing |
-| `src/osm.js` | Nominatim (one request a second, as its policy asks) and Overpass |
-| `src/worker.js` | Downloads and builds new areas off the main thread |
+| `src/osm.js` | Photon suggestions, Nominatim (one request a second, as its policy asks) and Overpass |
+| `src/worker.js` | Loads and builds new areas off the main thread |
 
 ## Design
 
@@ -82,4 +84,4 @@ To use a new preset, add it to `PRESETS` in `src/main.js`.
 
 ## Data
 
-Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available under the Open Database License. The files in `data/` are derived from it.
+Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available under the Open Database License. The files in `data/` are derived from it. Map tiles by [OpenFreeMap](https://openfreemap.org) (OpenMapTiles schema), search by [Photon](https://photon.komoot.io) and [Nominatim](https://nominatim.org).

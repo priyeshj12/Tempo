@@ -14,6 +14,54 @@ export const CATEGORIES = [
 
 const WALK_M_PER_MIN = 80; // about 4.8 km/h
 
+// OpenMapTiles poi subclasses are OSM tag values without their key; these
+// are the keys to try, in order, when rebuilding tags for classify().
+const POI_KEYS = ['amenity', 'shop', 'tourism', 'leisure', 'natural', 'historic'];
+
+/**
+ * Place candidates from the poi layer of z14 map tiles (see tiles.js),
+ * shaped like candidatesFrom() results. Tiles carry no cuisine or Wikidata,
+ * so these are plainer than Overpass results but arrive at once.
+ */
+export function candidatesFromTiles(tiles, tileLonLat, lang = 'en') {
+  const out = [];
+  const seen = new Set();
+  for (const t of tiles) {
+    const E = t.layer.extent;
+    for (const f of t.layer.features) {
+      const p = f.props;
+      const name = p[`name:${lang}`] || (lang === 'en' && p.name_en) || p.name;
+      if (!name || !p.subclass) continue;
+      let cls = null;
+      for (const key of POI_KEYS) {
+        cls = classify({ name, [key]: p.subclass });
+        if (cls) break;
+      }
+      if (!cls) continue;
+      for (let i = 0; i < f.points.length; i += 2) {
+        const [lon, lat] = tileLonLat(t.x + f.points[i] / E, t.y + f.points[i + 1] / E, t.z);
+        const key = `${name}|${lat.toFixed(4)}|${lon.toFixed(4)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          id: key,
+          category: cls.category,
+          kind: cls.kind,
+          name,
+          lat,
+          lon,
+          area: 0,
+          notable: false,
+          details: false,
+          park: p.subclass === 'park' || p.subclass === 'garden',
+          url: `https://www.openstreetmap.org/?mlat=${lat.toFixed(6)}&mlon=${lon.toFixed(6)}#map=19/${lat.toFixed(6)}/${lon.toFixed(6)}`,
+        });
+      }
+    }
+  }
+  return out;
+}
+
 /** Overpass QL for named places of every group around a point. */
 export function placesQuery(lat, lon, radius = 1200) {
   const at = `(around:${Math.round(radius)},${lat.toFixed(6)},${lon.toFixed(6)})`;
@@ -252,7 +300,7 @@ export function rankCandidates(candidates, { graph, walk, limit = 5 }) {
       minutes: Math.max(1, Math.round(metres / WALK_M_PER_MIN)),
       notable: p.notable,
       score: metres / boost,
-      url: `https://www.openstreetmap.org/${p.id}`,
+      url: p.url || `https://www.openstreetmap.org/${p.id}`,
     });
   }
 

@@ -109,6 +109,7 @@ export function searchGazetteer(bundle, query, limit = 5) {
     out.push({
       label,
       detail: `${label}, ${TYPE_LABEL[g.type]} in ${bundle.city}`,
+      sub: `${TYPE_LABEL[g.type][0].toUpperCase()}${TYPE_LABEL[g.type].slice(1)} in ${bundle.city}`,
       lat: g.lat,
       lon: g.lon,
       city: bundle.city,
